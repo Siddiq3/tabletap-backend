@@ -8,7 +8,8 @@
     "build": "tsup src/index.ts --format esm --target node20 --clean",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "db:backup": "pg_dump \"$DATABASE_URL\" --no-owner --no-privileges -Fc -f backup.dump"
+    "db:backup": "pg_dump \"$DATABASE_URL\" --no-owner --no-privileges -Fc -f backup.dump",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "1.13.2",
