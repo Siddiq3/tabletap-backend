@@ -68,7 +68,9 @@ export function isValidUpiId(upiId: string): boolean {
 }
 
 /** Standard UPI deep link; opens GPay / PhonePe / Paytm with the amount filled in. */
+// pa stays literal ("@" unencoded, already checked by isValidUpiId); pn/tn use %20, never "+",
+// because some UPI apps show "+" as-is or reject an encoded "@".
 export function upiLink(upiId: string, payeeName: string, paise: number, note: string): string {
-  const p = new URLSearchParams({ pa: upiId, pn: payeeName, am: (paise / 100).toFixed(2), cu: "INR", tn: note });
-  return `upi://pay?${p.toString()}`;
+  const enc = encodeURIComponent;
+  return `upi://pay?pa=${upiId}&pn=${enc(payeeName)}&am=${(paise / 100).toFixed(2)}&cu=INR&tn=${enc(note)}`;
 }

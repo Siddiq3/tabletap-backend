@@ -1,7 +1,7 @@
 // Run: npm test. Pure validation only; no database needed.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isValidUpiId } from "./contract";
+import { isValidUpiId, upiLink } from "./contract";
 import { readRestaurantPatch } from "./app";
 
 const rejects = (b: object) => assert.throws(() => readRestaurantPatch(b), (e: { status?: number }) => e.status === 400);
@@ -11,6 +11,13 @@ test("UPI ID format", () => {
   for (const no of ["", "spiceroute", "@okaxis", "a@okaxis", "name@ok1", "name@b", "name @okaxis", "a@b@okaxis"]) {
     assert.ok(!isValidUpiId(no), no);
   }
+});
+
+test("upiLink: literal @, %20 not +, 2-decimal amount from paise", () => {
+  assert.equal(
+    upiLink("spice.route@okaxis", "Spice Route Kitchen", 48000, "Order 1042"),
+    "upi://pay?pa=spice.route@okaxis&pn=Spice%20Route%20Kitchen&am=480.00&cu=INR&tn=Order%201042",
+  );
 });
 
 test("only sent fields change; empty removes address and UPI ID", () => {
