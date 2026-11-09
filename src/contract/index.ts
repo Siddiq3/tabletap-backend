@@ -3,7 +3,7 @@
 // and bump CONTRACT_VERSION in index.ts.
 
 /** Must match in all three repos. The backend returns it from /health so you can spot a mismatch. */
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 3;
 
 export * from "./types";
 export * from "./rules";

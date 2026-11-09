@@ -1,12 +1,13 @@
 // Database rows (snake_case) → domain objects (camelCase). The only place that knows column names.
-import type { DiningTable, MenuCategory, MenuItem, Order, Restaurant, Role } from "../../contract";
+import type { DiningTable, MenuCategory, MenuItem, Order, Restaurant, Role, StaffMember, UserProfile } from "../../contract";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Row = Record<string, any>;
 
 export const ORDER_SELECT =
   "id, order_no, table_id, status, payment_status, payment_method, note, subtotal_paise, tax_paise, total_paise, created_at, " +
-  "dining_tables(label), order_items(name, is_veg, unit_price_paise, qty)";
+  "dining_tables(label), order_items(name, is_veg, unit_price_paise, qty), " +
+  "paid_by:staff_members!orders_paid_by_staff_id_fkey(name)";
 
 export const toRestaurant = (r: Row): Restaurant => ({
   id: r.id,
@@ -57,10 +58,27 @@ export const toOrder = (r: Row): Order => ({
   taxPaise: r.tax_paise,
   totalPaise: r.total_paise,
   createdAt: r.created_at,
+  paidByName: r.paid_by?.name ?? null,
   lines: (r.order_items ?? []).map((l: Row) => ({
     name: l.name,
     isVeg: l.is_veg,
     unitPricePaise: l.unit_price_paise,
     qty: l.qty,
   })),
+});
+
+export const STAFF_SELECT = "id, name, role, is_active";
+
+export const toStaff = (r: Row): StaffMember => ({
+  id: r.id,
+  name: r.name,
+  role: r.role,
+  isActive: r.is_active,
+});
+
+export const toProfile = (r: Row): UserProfile => ({
+  fullName: r.full_name,
+  username: r.username,
+  email: r.email ?? null,
+  phone: r.phone ?? null,
 });
