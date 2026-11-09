@@ -1,14 +1,20 @@
 import type { SupabaseClient, PostgrestError } from "@supabase/supabase-js";
 import type { Repos } from "../../ports";
 import { DomainError, ERROR_MESSAGES, startOfTodayIST } from "../../contract";
-import { ORDER_SELECT, toCategory, toItem, toOrder, toRestaurant, toTable, type Row } from "./mappers";
+import { ORDER_SELECT, STAFF_SELECT, toCategory, toItem, toOrder, toProfile, toRestaurant, toStaff, toTable, type Row } from "./mappers";
 
 function fail(error: PostgrestError): never {
   const code = Object.keys(ERROR_MESSAGES).find((c) => error.message.includes(c));
   if (code) throw new DomainError(code, ERROR_MESSAGES[code]);
-  if (error.code === "23505" && error.message.includes("slug")) throw new DomainError("SLUG_TAKEN", ERROR_MESSAGES.SLUG_TAKEN);
+  if (error.code === "23505") {
+    for (const [field, code] of [["slug", "SLUG_TAKEN"], ["username", "USERNAME_TAKEN"], ["email", "EMAIL_TAKEN"], ["phone", "PHONE_TAKEN"]]) {
+      if (error.message.includes(field)) throw new DomainError(code, ERROR_MESSAGES[code]);
+    }
+  }
   throw new Error(error.message);
 }
+
+const isUuid = (s: string) => /^[0-9a-f-]{36}$/i.test(s);
 
 function ok<T>(res: { data: T | null; error: PostgrestError | null }): T {
   if (res.error) fail(res.error);
@@ -170,17 +176,128 @@ export function supabaseRepos(db: SupabaseClient): Repos {
         return rows.map(toOrder);
       },
 
-      async setStatus(restaurantId, orderId, status) {
-        ok(await db.from("orders").update({ status }).eq("restaurant_id", restaurantId).eq("id", orderId));
-      },
-
-      async markPaid(restaurantId, orderId, method) {
+      async setStatus(restaurantId, orderId, status, staffId) {
         ok(
           await db
             .from("orders")
-            .update({ payment_status: "paid", payment_method: method })
+            .update({ status, status_changed_by_staff_id: staffId })
             .eq("restaurant_id", restaurantId)
             .eq("id", orderId),
+        );
+      },
+
+      async markPaid(restaurantId, orderId, method, staffId) {
+        ok(
+          await db
+            .from("orders")
+            .update({ payment_status: "paid", payment_method: method, paid_by_staff_id: staffId })
+            .eq("restaurant_id", restaurantId)
+            .eq("id", orderId),
+        );
+      },
+    },
+
+    profiles: {
+      async find(id) {
+        const row = ok(await db.from("user_profiles").select("*").eq(id.kind, id.value).maybeSingle()) as Row | null;
+        return row ? { userId: row.user_id, ...toProfile(row) } : null;
+      },
+
+      async get(userId) {
+        const row = ok(await db.from("user_profiles").select("*").eq("user_id", userId).maybeSingle());
+        return row ? toProfile(row) : null;
+      },
+
+      async create(userId, p) {
+        ok(
+          await db.from("user_profiles").insert({
+            user_id: userId, full_name: p.fullName, username: p.username, email: p.email, phone: p.phone,
+          }),
+        );
+      },
+    },
+
+    staff: {
+      async list(restaurantId) {
+        const rows = ok(
+          await db.from("staff_members").select(STAFF_SELECT).eq("restaurant_id", restaurantId).order("name"),
+        ) as Row[];
+        return rows.map(toStaff);
+      },
+
+      async get(restaurantId, staffId) {
+        if (!isUuid(staffId)) return null;
+        const row = ok(
+          await db.from("staff_members").select(STAFF_SELECT).eq("restaurant_id", restaurantId).eq("id", staffId).maybeSingle(),
+        );
+        return row ? toStaff(row as Row) : null;
+      },
+
+      async create(restaurantId, input) {
+        const row = ok(
+          await db
+            .from("staff_members")
+            .insert({ restaurant_id: restaurantId, name: input.name, role: input.role, pin_hash: input.pinHash })
+            .select(STAFF_SELECT)
+            .single(),
+        ) as Row;
+        return toStaff(row);
+      },
+
+      async update(restaurantId, staffId, patch) {
+        const row: Row = {};
+        if (patch.name !== undefined) row.name = patch.name;
+        if (patch.role !== undefined) row.role = patch.role;
+        if (patch.isActive !== undefined) row.is_active = patch.isActive;
+        const updated = ok(
+          await db.from("staff_members").update(row).eq("restaurant_id", restaurantId).eq("id", staffId).select(STAFF_SELECT).single(),
+        ) as Row;
+        return toStaff(updated);
+      },
+
+      async setPinHash(restaurantId, staffId, pinHash) {
+        ok(
+          await db
+            .from("staff_members")
+            .update({ pin_hash: pinHash, failed_pin_attempts: 0, locked_until: null })
+            .eq("restaurant_id", restaurantId)
+            .eq("id", staffId),
+        );
+      },
+
+      async claimPinAttempt(staffId) {
+        if (!isUuid(staffId)) return null;
+        const rows = ok(await db.rpc("claim_pin_attempt", { p_staff_id: staffId })) as Row[];
+        const r = rows[0];
+        return r ? { pinHash: r.out_pin_hash, restaurantId: r.out_restaurant_id } : null;
+      },
+
+      async pinSucceeded(staffId) {
+        ok(await db.from("staff_members").update({ failed_pin_attempts: 0, locked_until: null }).eq("id", staffId));
+      },
+
+      async createSession(staffId, tokenHash, expiresAt) {
+        ok(await db.from("staff_sessions").insert({ staff_id: staffId, token_hash: tokenHash, expires_at: expiresAt }));
+      },
+
+      async findSession(tokenHash) {
+        const row = ok(
+          await db
+            .from("staff_sessions")
+            .select(`staff_members!inner(${STAFF_SELECT}, restaurant_id)`)
+            .eq("token_hash", tokenHash)
+            .is("revoked_at", null)
+            .gt("expires_at", new Date().toISOString())
+            .eq("staff_members.is_active", true)
+            .maybeSingle(),
+        ) as Row | null;
+        const m = row?.staff_members;
+        return m ? { staff: toStaff(m), restaurantId: m.restaurant_id } : null;
+      },
+
+      async revokeSessions(staffId) {
+        ok(
+          await db.from("staff_sessions").update({ revoked_at: new Date().toISOString() }).eq("staff_id", staffId).is("revoked_at", null),
         );
       },
     },

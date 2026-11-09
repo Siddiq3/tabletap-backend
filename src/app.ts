@@ -3,21 +3,37 @@ import { cors } from "hono/cors";
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import {
-  CONTRACT_VERSION, DomainError, canMoveTo, isValidUpiId, slugify,
-  type CreateRestaurantRequest, type Membership, type MenuItemPatch, type NewMenuItem, type OrderStatus,
-  type PaymentMethod, type PlaceOrderRequest, type PublicRestaurant, type Restaurant, type Role,
-  type UpdateRestaurantRequest,
+  CONTRACT_VERSION, DomainError, PASSWORD_MIN, STAFF_SESSION_ERROR, canMoveTo, detectIdentifier, isValidEmail,
+  isValidPin, isValidUpiId, isValidUsername, normalizeIndianPhone, slugify,
+  type CreateRestaurantRequest, type LoginRequest, type Membership, type MenuItemPatch, type NewMenuItem,
+  type NewStaffRequest, type OrderStatus, type PaymentMethod, type PinSessionRequest, type PlaceOrderRequest,
+  type PublicRestaurant, type Restaurant, type Role, type SignupRequest, type StaffMember, type StaffPatch,
+  type StaffRole, type UpdateRestaurantRequest,
 } from "./contract";
-import { getAuthVerifier, getRepos } from "./adapters";
-import { rateLimit } from "./rate-limit";
+import { getAuth, getRepos } from "./adapters";
+import { clientIp, limiter, rateLimit } from "./rate-limit";
+import { hashPin, hashToken, newToken, verifyPin } from "./pin";
 
-type Env = { Variables: { userId: string; membership: Membership } };
+type Env = {
+  Variables: {
+    userId: string;
+    /** Effective: the PIN staff member's role while a staff session is active, else the login's own role. */
+    membership: Membership;
+    /** Role of the account logged in on the device, whatever staff member is using it. */
+    deviceRole: Role;
+    /** The PIN staff member acting, if any. */
+    staff: StaffMember | null;
+  };
+};
 
 const UUID = /^[0-9a-f-]{36}$/i;
 const MANAGERS: Role[] = ["owner", "manager"];
 const CASHIERS: Role[] = ["owner", "manager", "cashier"];
 const STATUSES: OrderStatus[] = ["new", "preparing", "ready", "served", "cancelled"];
 const METHODS: PaymentMethod[] = ["upi", "cash", "card", "online"];
+const STAFF_ROLES: StaffRole[] = ["manager", "cashier", "kitchen", "waiter"];
+const STAFF_SESSION_MS = 8 * 60 * 60_000;
+const WRONG_LOGIN = "Wrong login or password.";
 
 function bad(message: string): never {
   throw new HTTPException(400, { message });
@@ -75,7 +91,7 @@ app.use(
   "*",
   cors({
     origin: (origin) => (allowed.includes(origin) ? origin : null),
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "X-Staff-Session"],
     allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     maxAge: 600,
   }),
@@ -143,11 +159,81 @@ app.get("/public/r/:slug/orders/:id", async (c) => {
   return c.json({ restaurant: toPublic(restaurant!), order });
 });
 
+// ---------- owner/manager login ----------
+/** Validates POST /auth/signup. Returns the normalised profile + password. */
+export function readSignup(b: Partial<SignupRequest>) {
+  const fullName = String(b.fullName ?? "").trim();
+  const username = String(b.username ?? "").trim().toLowerCase();
+  const password = String(b.password ?? "");
+  const emailRaw = String(b.email ?? "").trim().toLowerCase();
+  const phoneRaw = String(b.phone ?? "").trim();
+  if (!fullName || fullName.length > 80) bad("Enter your full name.");
+  if (!isValidUsername(username)) bad("Username must be 3 to 30 characters: a–z, 0–9, _ or . and at least one letter.");
+  // 72: bcrypt (Supabase, Cognito-compatible) ignores anything longer
+  if (password.length < PASSWORD_MIN || password.length > 72) bad(`Password must be ${PASSWORD_MIN} to 72 characters.`);
+  if (emailRaw && !isValidEmail(emailRaw)) bad("That email looks wrong.");
+  const phone = phoneRaw ? normalizeIndianPhone(phoneRaw) : null;
+  if (phoneRaw && !phone) bad("Enter a 10-digit Indian mobile number.");
+  if (!emailRaw && !phone) bad("Enter your email or phone number, so you can log in with it.");
+  return { profile: { fullName, username, email: emailRaw || null, phone }, password };
+}
+
+app.post("/auth/signup", rateLimit(10, 60 * 60_000, "Too many sign-ups from this network. Try again in an hour."), async (c) => {
+  const { profile, password } = readSignup(await body<SignupRequest>(c));
+  const repos = getRepos();
+  const auth = getAuth();
+  // Friendly errors before creating anything; the unique constraints still catch races.
+  if (await repos.profiles.find({ kind: "username", value: profile.username })) throw new DomainError("USERNAME_TAKEN", "That username is taken. Try another.");
+  if (profile.phone && (await repos.profiles.find({ kind: "phone", value: profile.phone }))) {
+    throw new DomainError("PHONE_TAKEN", "An account with this phone number already exists. Log in instead.");
+  }
+  const userId = await auth.createUser({ email: profile.email, password });
+  try {
+    await repos.profiles.create(userId, profile);
+  } catch (e) {
+    await auth.deleteUser(userId);
+    throw e;
+  }
+  const session = await auth.signInWithPassword({ userId }, password);
+  if (!session) throw new Error("signup: sign-in right after createUser failed");
+  return c.json({ session }, 201);
+});
+
+const loginHit = limiter(5, 10 * 60_000);
+app.post("/auth/login", async (c) => {
+  const b = await body<LoginRequest>(c);
+  const raw = String(b.identifier ?? "");
+  const password = String(b.password ?? "");
+  if (!loginHit(`${clientIp(c)}|${raw.trim().toLowerCase()}`)) {
+    throw new HTTPException(429, { message: "Too many login attempts. Wait 10 minutes and try again." });
+  }
+  const id = detectIdentifier(raw);
+  if (!id || !password) throw new HTTPException(401, { message: WRONG_LOGIN });
+  const profile = await getRepos().profiles.find(id);
+  // Accounts from before v3 have no profile; their email still logs in.
+  const who = profile ? { userId: profile.userId } : id.kind === "email" ? { email: id.value } : null;
+  const session = who ? await getAuth().signInWithPassword(who, password) : null;
+  if (!session) throw new HTTPException(401, { message: WRONG_LOGIN });
+  return c.json({ session });
+});
+
+app.post("/auth/forgot-password", rateLimit(5, 10 * 60_000, "Too many reset requests. Wait 10 minutes and try again."), async (c) => {
+  const id = detectIdentifier(String((await body<{ identifier: string }>(c)).identifier ?? ""));
+  if (!id) bad("Enter your email, phone or username.");
+  const profile = await getRepos().profiles.find(id!);
+  const email = profile ? profile.email : id!.kind === "email" ? id!.value : null;
+  if (profile && !email) {
+    return c.json({ emailSent: false, message: "Contact Tabletap support to reset your password." });
+  }
+  if (email) await getAuth().sendPasswordReset(email);
+  return c.json({ emailSent: true, message: "If that account exists, we've emailed a link to reset your password." });
+});
+
 // ---------- signed-in ----------
 const requireUser = createMiddleware<Env>(async (c, next) => {
   const header = c.req.header("Authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  const userId = token ? await getAuthVerifier().verify(token) : null;
+  const userId = token ? await getAuth().verify(token) : null;
   if (!userId) throw new HTTPException(401, { message: "Please log in again." });
   c.set("userId", userId);
   await next();
@@ -160,6 +246,24 @@ const requireMember = createMiddleware<Env>(async (c, next) => {
     throw new HTTPException(402, { message: "Your plan is paused. Renew your subscription to continue." });
   }
   c.set("membership", membership);
+  c.set("deviceRole", membership.role);
+  c.set("staff", null);
+  await next();
+});
+
+/** X-Staff-Session: a PIN staff member is using this device; their role replaces the device login's. */
+const applyStaffSession = createMiddleware<Env>(async (c, next) => {
+  const token = c.req.header("X-Staff-Session");
+  if (token) {
+    const found = await getRepos().staff.findSession(hashToken(token));
+    const membership = c.get("membership");
+    // Only on an owner/manager device of the same restaurant.
+    if (!found || found.restaurantId !== membership.restaurant.id || !MANAGERS.includes(c.get("deviceRole"))) {
+      return c.json({ error: "Staff session ended. Tap your name and enter your PIN again.", code: STAFF_SESSION_ERROR }, 401);
+    }
+    c.set("staff", found.staff);
+    c.set("membership", { ...membership, role: found.staff.role });
+  }
   await next();
 });
 
@@ -172,8 +276,12 @@ const allow = (roles: Role[]) =>
   });
 
 app.get("/me", requireUser, async (c) => {
-  const membership = await getRepos().restaurants.getMembership(c.get("userId"));
-  return c.json({ userId: c.get("userId"), membership });
+  const repos = getRepos();
+  const [membership, profile] = await Promise.all([
+    repos.restaurants.getMembership(c.get("userId")),
+    repos.profiles.get(c.get("userId")),
+  ]);
+  return c.json({ userId: c.get("userId"), membership, profile });
 });
 
 app.post("/restaurants", requireUser, async (c) => {
@@ -198,7 +306,8 @@ app.post("/restaurants", requireUser, async (c) => {
 
 // ---------- restaurant staff ----------
 const staff = new Hono<Env>();
-staff.use("*", requireUser, requireMember);
+staff.use("*", requireUser, requireMember, applyStaffSession);
+const staffId = (c: { get: (k: "staff") => StaffMember | null }) => c.get("staff")?.id ?? null;
 
 staff.get("/orders", async (c) => {
   const orders = await getRepos().orders.listBoard(c.get("membership").restaurant.id);
@@ -218,7 +327,7 @@ staff.post("/orders/:id/status", async (c) => {
   if (!canMoveTo(order!.status, to as OrderStatus)) {
     throw new HTTPException(409, { message: "This order already moved on. Refresh to see the latest." });
   }
-  await repos.orders.setStatus(rid, order!.id, to as OrderStatus);
+  await repos.orders.setStatus(rid, order!.id, to as OrderStatus, staffId(c));
   return c.body(null, 204);
 });
 
@@ -228,7 +337,7 @@ staff.post("/orders/:id/paid", allow(CASHIERS), async (c) => {
   const rid = c.get("membership").restaurant.id;
   const repos = getRepos();
   if (!(await repos.orders.get(rid, c.req.param("id")))) notFound("Order not found.");
-  await repos.orders.markPaid(rid, c.req.param("id"), method as PaymentMethod);
+  await repos.orders.markPaid(rid, c.req.param("id"), method as PaymentMethod, staffId(c));
   return c.body(null, 204);
 });
 
@@ -303,6 +412,93 @@ staff.patch("/restaurant", allow(MANAGERS), async (c) => {
 staff.get("/tables", allow(MANAGERS), async (c) => {
   const { restaurant } = c.get("membership");
   return c.json({ slug: restaurant.slug, tables: await getRepos().restaurants.listTables(restaurant.id) });
+});
+
+// ---------- staff with PINs ----------
+/** Managers (login or PIN) manage cashier/kitchen/waiter. Only the owner's own login manages managers. */
+function checkCanManage(c: { get: (k: "membership") => Membership }, ...roles: (StaffRole | undefined)[]) {
+  if (roles.includes("manager") && c.get("membership").role !== "owner") {
+    throw new HTTPException(403, { message: "Only the owner can add or change managers." });
+  }
+}
+
+const readStaffName = (v: unknown) => {
+  const name = String(v ?? "").trim();
+  if (!name || name.length > 40) bad("Enter the staff member's name (up to 40 characters).");
+  return name;
+};
+const readStaffRole = (v: unknown) => {
+  if (!STAFF_ROLES.includes(v as StaffRole)) bad("Choose a role: manager, cashier, kitchen or waiter.");
+  return v as StaffRole;
+};
+const readPin = (v: unknown) => {
+  if (typeof v !== "string" || !isValidPin(v)) bad("PIN must be 4 to 6 digits.");
+  return v as string;
+};
+
+staff.get("/members", allow(MANAGERS), async (c) => {
+  return c.json({ staff: await getRepos().staff.list(c.get("membership").restaurant.id) });
+});
+
+staff.post("/members", allow(MANAGERS), async (c) => {
+  const b = await body<NewStaffRequest>(c);
+  const input = { name: readStaffName(b.name), role: readStaffRole(b.role), pinHash: await hashPin(readPin(b.pin)) };
+  checkCanManage(c, input.role);
+  return c.json(await getRepos().staff.create(c.get("membership").restaurant.id, input), 201);
+});
+
+staff.patch("/members/:id", allow(MANAGERS), async (c) => {
+  const b = await body<StaffPatch>(c);
+  const patch: StaffPatch = {};
+  if (b.name !== undefined) patch.name = readStaffName(b.name);
+  if (b.role !== undefined) patch.role = readStaffRole(b.role);
+  if (b.isActive !== undefined) patch.isActive = !!b.isActive;
+  if (Object.keys(patch).length === 0) bad("Nothing to update.");
+  const rid = c.get("membership").restaurant.id;
+  const repos = getRepos();
+  const target = await repos.staff.get(rid, c.req.param("id"));
+  if (!target) notFound("Staff member not found.");
+  checkCanManage(c, target!.role, patch.role);
+  const updated = await repos.staff.update(rid, target!.id, patch);
+  if (patch.isActive === false || (patch.role && patch.role !== target!.role)) await repos.staff.revokeSessions(target!.id);
+  return c.json(updated);
+});
+
+staff.post("/members/:id/pin", allow(MANAGERS), async (c) => {
+  const pinHash = await hashPin(readPin((await body<{ pin: string }>(c)).pin));
+  const rid = c.get("membership").restaurant.id;
+  const repos = getRepos();
+  const target = await repos.staff.get(rid, c.req.param("id"));
+  if (!target) notFound("Staff member not found.");
+  checkCanManage(c, target!.role);
+  await repos.staff.setPinHash(rid, target!.id, pinHash);
+  await repos.staff.revokeSessions(target!.id);
+  return c.body(null, 204);
+});
+
+const WRONG_PIN = "Wrong PIN. After 5 wrong tries this name is locked for 5 minutes.";
+staff.post("/pin-session", rateLimit(30, 60_000, "Too many PIN tries from this device. Wait a minute."), async (c) => {
+  // The device's own login decides, not any staff member currently using it.
+  if (!MANAGERS.includes(c.get("deviceRole"))) {
+    throw new HTTPException(403, { message: "Staff PINs work on a device where the owner or a manager is logged in." });
+  }
+  const b = await body<PinSessionRequest>(c);
+  const pin = typeof b.pin === "string" ? b.pin : "";
+  const rid = c.get("membership").restaurant.id;
+  const repos = getRepos();
+  const claim = await repos.staff.claimPinAttempt(String(b.staffId ?? ""));
+  if (!claim || claim.restaurantId !== rid) {
+    // Unknown, inactive or locked. Locked is the only case staff can hit by mistake, so say so.
+    throw new HTTPException(423, { message: "This name is locked for a few minutes after wrong PINs, or no longer active. Ask the owner." });
+  }
+  // 400, not 401: clients treat 401 as "logged out".
+  if (!isValidPin(pin) || !(await verifyPin(pin, claim.pinHash))) bad(WRONG_PIN);
+  const member = (await repos.staff.get(rid, b.staffId!))!;
+  await repos.staff.pinSucceeded(member.id);
+  const token = newToken();
+  const expiresAt = new Date(Date.now() + STAFF_SESSION_MS).toISOString();
+  await repos.staff.createSession(member.id, hashToken(token), expiresAt);
+  return c.json({ token, expiresAt, staff: member });
 });
 
 app.route("/staff", staff);

@@ -3,6 +3,8 @@
 // and bump CONTRACT_VERSION in index.ts.
 
 export type Role = "owner" | "manager" | "cashier" | "kitchen" | "waiter";
+/** Staff without an account (name + PIN). Owners always log in with a password. */
+export type StaffRole = Exclude<Role, "owner">;
 export type OrderStatus = "new" | "preparing" | "ready" | "served" | "cancelled";
 export type PaymentStatus = "unpaid" | "paid" | "refunded";
 export type PaymentMethod = "upi" | "cash" | "card" | "online";
@@ -80,6 +82,8 @@ export interface Order {
   totalPaise: number;
   createdAt: string;
   lines: OrderLine[];
+  /** Staff member who marked it paid; null when the owner/manager did it with their own login. Added in v3. */
+  paidByName?: string | null;
 }
 
 export interface PlaceOrderInput {
@@ -94,4 +98,18 @@ export interface NewRestaurant {
   slug: string;
   upiId: string | null;
   tableCount: number;
+}
+
+export interface StaffMember {
+  id: string;
+  name: string;
+  role: StaffRole;
+  isActive: boolean;
+}
+
+export interface UserProfile {
+  fullName: string;
+  username: string;
+  email: string | null;
+  phone: string | null;
 }

@@ -16,6 +16,9 @@ export const ERROR_MESSAGES: Record<string, string> = {
   ITEM_UNAVAILABLE: "A dish in your cart just sold out. Remove it and try again.",
   RESTAURANT_UNAVAILABLE: "This restaurant is not taking orders right now.",
   SLUG_TAKEN: "That link is already used by another restaurant. Try another.",
+  USERNAME_TAKEN: "That username is taken. Try another.",
+  EMAIL_TAKEN: "An account with this email already exists. Log in instead.",
+  PHONE_TAKEN: "An account with this phone number already exists. Log in instead.",
 };
 
 export const BOARD_STAGES: OrderStatus[] = ["new", "preparing", "ready", "served"];
@@ -74,3 +77,41 @@ export function upiLink(upiId: string, payeeName: string, paise: number, note: s
   const enc = encodeURIComponent;
   return `upi://pay?pa=${upiId}&pn=${enc(payeeName)}&am=${(paise / 100).toFixed(2)}&cu=INR&tn=${enc(note)}`;
 }
+
+// ---------- login identifiers (same rules in forms and on the server) ----------
+export const PASSWORD_MIN = 8;
+
+/** Indian mobile → "+91XXXXXXXXXX", or null. Accepts spaces/dashes, a leading 0, 91 or +91. */
+export function normalizeIndianPhone(raw: string): string | null {
+  const digits = raw.trim().replace(/[\s\-()]/g, "");
+  const m = /^(?:\+91|91|0)?([6-9]\d{9})$/.exec(digits);
+  return m ? `+91${m[1]}` : null;
+}
+
+/** 3–30 of a–z 0–9 _ . with at least one letter (so a username never looks like a phone number). */
+export function isValidUsername(username: string): boolean {
+  return /^[a-z0-9_.]{3,30}$/.test(username) && /[a-z]/.test(username);
+}
+
+export function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
+
+export type LoginIdentifier =
+  | { kind: "email"; value: string }
+  | { kind: "phone"; value: string }
+  | { kind: "username"; value: string };
+
+/** What the "Email, phone or username" field holds, normalised; null if it can't be any of them. */
+export function detectIdentifier(raw: string): LoginIdentifier | null {
+  const s = raw.trim().toLowerCase();
+  if (s.includes("@")) return isValidEmail(s) ? { kind: "email", value: s } : null;
+  const phone = normalizeIndianPhone(s);
+  if (phone) return { kind: "phone", value: phone };
+  return isValidUsername(s) ? { kind: "username", value: s } : null;
+}
+
+export const isValidPin = (pin: string): boolean => /^\d{4,6}$/.test(pin);
+
+/** Shared devices lock back to "Who's working?" after this long without a tap. */
+export const STAFF_IDLE_LOCK_MS = 10 * 60_000;

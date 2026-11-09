@@ -7,6 +7,7 @@
 // (Supabase today, AWS later) without touching either client.
 import type {
   DiningTable, Membership, Menu, MenuCategory, MenuItem, NewMenuItem, Order, OrderStatus, PaymentMethod, Restaurant,
+  StaffMember, StaffRole, UserProfile,
 } from "./types";
 
 export interface PublicRestaurant {
@@ -44,6 +45,70 @@ export interface PublicOrderResponse {
 export interface MeResponse {
   userId: string;
   membership: Membership | null;
+  /** Null for accounts made before v3 (email-code logins). */
+  profile?: UserProfile | null;
+}
+
+// ---------- owner/manager login ----------
+/** Email and/or phone: at least one is required. */
+export interface SignupRequest {
+  fullName: string;
+  username: string;
+  password: string;
+  email?: string;
+  phone?: string;
+}
+
+export interface LoginRequest {
+  /** Email, phone or username; the backend works out which. */
+  identifier: string;
+  password: string;
+}
+
+/** Hand both tokens to the login provider (lib/auth.ts setSession). */
+export interface AuthSession {
+  accessToken: string;
+  refreshToken: string;
+}
+
+export interface AuthResponse {
+  session: AuthSession;
+}
+
+export interface ForgotPasswordResponse {
+  /** false → the account has no real email; show `message` (contact support). */
+  emailSent: boolean;
+  message: string;
+}
+
+// ---------- staff with PINs ----------
+export interface StaffListResponse {
+  staff: StaffMember[];
+}
+
+export interface NewStaffRequest {
+  name: string;
+  role: StaffRole;
+  pin: string;
+}
+
+/** Send only what changed. isActive: false deactivates and ends their sessions. */
+export interface StaffPatch {
+  name?: string;
+  role?: StaffRole;
+  isActive?: boolean;
+}
+
+export interface PinSessionRequest {
+  staffId: string;
+  pin: string;
+}
+
+/** Send `token` as X-Staff-Session on every call while this staff member is working. */
+export interface PinSessionResponse {
+  token: string;
+  expiresAt: string;
+  staff: StaffMember;
 }
 
 export interface CreateRestaurantRequest {
@@ -81,7 +146,18 @@ export class ApiError extends Error {
 
 const enc = encodeURIComponent;
 
-export function createApiClient(baseUrl: string, getToken: () => Promise<string | null>) {
+/** Error code when the X-Staff-Session token is expired/revoked: go back to "Who's working?", don't log out. */
+export const STAFF_SESSION_ERROR = "STAFF_SESSION";
+
+/**
+ * getStaffSession: the active PIN session token on a shared device, if any. When it returns a token,
+ * calls act as that staff member (their role decides permissions).
+ */
+export function createApiClient(
+  baseUrl: string,
+  getToken: () => Promise<string | null>,
+  getStaffSession: () => string | null = () => null,
+) {
   const base = baseUrl.replace(/\/+$/, "");
 
   async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -89,6 +165,8 @@ export function createApiClient(baseUrl: string, getToken: () => Promise<string 
     const headers: Record<string, string> = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (token) headers.Authorization = `Bearer ${token}`;
+    const staffSession = getStaffSession();
+    if (staffSession) headers["X-Staff-Session"] = staffSession;
 
     let res: Response;
     try {
@@ -117,6 +195,11 @@ export function createApiClient(baseUrl: string, getToken: () => Promise<string 
     publicOrder: (slug: string, orderId: string) =>
       call<PublicOrderResponse>("GET", `/public/r/${enc(slug)}/orders/${enc(orderId)}`),
 
+    // owner/manager login (no token needed)
+    signup: (body: SignupRequest) => call<AuthResponse>("POST", "/auth/signup", body),
+    login: (body: LoginRequest) => call<AuthResponse>("POST", "/auth/login", body),
+    forgotPassword: (identifier: string) => call<ForgotPasswordResponse>("POST", "/auth/forgot-password", { identifier }),
+
     // signed-in
     me: () => call<MeResponse>("GET", "/me"),
     createRestaurant: (body: CreateRestaurantRequest) => call<{ restaurantId: string }>("POST", "/restaurants", body),
@@ -132,6 +215,14 @@ export function createApiClient(baseUrl: string, getToken: () => Promise<string 
     deleteItem: (itemId: string) => call<null>("DELETE", `/staff/menu/items/${enc(itemId)}`),
     tables: () => call<TablesResponse>("GET", "/staff/tables"),
     updateRestaurant: (body: UpdateRestaurantRequest) => call<Restaurant>("PATCH", "/staff/restaurant", body),
+
+    // staff with PINs (owner/manager device)
+    staffList: () => call<StaffListResponse>("GET", "/staff/members"),
+    createStaff: (body: NewStaffRequest) => call<StaffMember>("POST", "/staff/members", body),
+    updateStaff: (staffId: string, patch: StaffPatch) => call<StaffMember>("PATCH", `/staff/members/${enc(staffId)}`, patch),
+    deactivateStaff: (staffId: string) => call<StaffMember>("PATCH", `/staff/members/${enc(staffId)}`, { isActive: false }),
+    setStaffPin: (staffId: string, pin: string) => call<null>("POST", `/staff/members/${enc(staffId)}/pin`, { pin }),
+    startPinSession: (body: PinSessionRequest) => call<PinSessionResponse>("POST", "/staff/pin-session", body),
   };
 }
 
