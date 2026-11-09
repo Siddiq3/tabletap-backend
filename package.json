@@ -1,0 +1,24 @@
+{
+  "name": "tabletap-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "tsup src/index.ts --format esm --target node20 --clean",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "db:backup": "pg_dump \"$DATABASE_URL\" --no-owner --no-privileges -Fc -f backup.dump"
+  },
+  "dependencies": {
+    "@hono/node-server": "1.13.2",
+    "@supabase/supabase-js": "2.45.4",
+    "hono": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.11",
+    "tsup": "8.3.0",
+    "tsx": "4.19.1",
+    "typescript": "5.6.3"
+  }
+}
