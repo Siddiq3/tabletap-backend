@@ -6,7 +6,7 @@
 // Web and app both talk to the backend only through createApiClient, so the backend can move
 // (Supabase today, AWS later) without touching either client.
 import type {
-  DiningTable, Membership, Menu, MenuCategory, MenuItem, NewMenuItem, Order, OrderStatus, PaymentMethod,
+  DiningTable, Membership, Menu, MenuCategory, MenuItem, NewMenuItem, Order, OrderStatus, PaymentMethod, Restaurant,
 } from "./types";
 
 export interface PublicRestaurant {
@@ -51,6 +51,14 @@ export interface CreateRestaurantRequest {
   slug: string;
   upiId?: string;
   tableCount: number;
+}
+
+/** Owner/manager settings. Send only what changed; an empty string removes address or UPI ID. */
+export interface UpdateRestaurantRequest {
+  name?: string;
+  address?: string;
+  upiId?: string;
+  taxPercent?: number;
 }
 
 export interface TablesResponse {
@@ -123,6 +131,7 @@ export function createApiClient(baseUrl: string, getToken: () => Promise<string 
     updateItem: (itemId: string, patch: MenuItemPatch) => call<null>("PATCH", `/staff/menu/items/${enc(itemId)}`, patch),
     deleteItem: (itemId: string) => call<null>("DELETE", `/staff/menu/items/${enc(itemId)}`),
     tables: () => call<TablesResponse>("GET", "/staff/tables"),
+    updateRestaurant: (body: UpdateRestaurantRequest) => call<Restaurant>("PATCH", "/staff/restaurant", body),
   };
 }
 

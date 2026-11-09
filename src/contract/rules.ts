@@ -62,6 +62,11 @@ export function slugify(name: string): string {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 }
 
+/** UPI ID like name@okaxis or 9876543210@ybl. Same rule on the server and in forms. */
+export function isValidUpiId(upiId: string): boolean {
+  return /^[\w.\-]{2,}@[a-zA-Z]{2,}$/.test(upiId);
+}
+
 /** Standard UPI deep link; opens GPay / PhonePe / Paytm with the amount filled in. */
 export function upiLink(upiId: string, payeeName: string, paise: number, note: string): string {
   const p = new URLSearchParams({ pa: upiId, pn: payeeName, am: (paise / 100).toFixed(2), cu: "INR", tn: note });

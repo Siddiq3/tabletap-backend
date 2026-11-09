@@ -3,9 +3,10 @@ import { cors } from "hono/cors";
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import {
-  CONTRACT_VERSION, DomainError, canMoveTo, slugify,
+  CONTRACT_VERSION, DomainError, canMoveTo, isValidUpiId, slugify,
   type CreateRestaurantRequest, type Membership, type MenuItemPatch, type NewMenuItem, type OrderStatus,
   type PaymentMethod, type PlaceOrderRequest, type PublicRestaurant, type Restaurant, type Role,
+  type UpdateRestaurantRequest,
 } from "./contract";
 import { getAuthVerifier, getRepos } from "./adapters";
 import { rateLimit } from "./rate-limit";
@@ -27,6 +28,40 @@ function notFound(message = "Not found."): never {
 type ItemBody = Partial<NewMenuItem & { isAvailable: boolean }>;
 const body = async <T>(c: { req: { json: () => Promise<unknown> } }): Promise<Partial<T>> =>
   ((await c.req.json().catch(() => null)) ?? {}) as Partial<T>;
+
+const UPI_HINT = "UPI ID looks wrong. It should look like name@okaxis.";
+
+type RestaurantPatch = Partial<Pick<Restaurant, "name" | "address" | "upiId" | "taxPercent">>;
+
+/** Validates PATCH /staff/restaurant. Only fields that were sent are changed; "" removes address or UPI ID. */
+export function readRestaurantPatch(b: Partial<UpdateRestaurantRequest>): RestaurantPatch {
+  const out: RestaurantPatch = {};
+  if (b.name !== undefined) {
+    const name = String(b.name).trim();
+    if (name.length < 2 || name.length > 80) bad("Restaurant name must be 2 to 80 characters.");
+    out.name = name;
+  }
+  if (b.address !== undefined) {
+    const address = String(b.address ?? "").trim();
+    if (address.length > 200) bad("Address is too long. Keep it under 200 characters.");
+    out.address = address || null;
+  }
+  if (b.upiId !== undefined) {
+    const upiId = String(b.upiId ?? "").trim();
+    if (upiId && !isValidUpiId(upiId)) bad(UPI_HINT);
+    out.upiId = upiId || null;
+  }
+  if (b.taxPercent !== undefined) {
+    const tax = b.taxPercent;
+    // numeric(5,2) in the database: at most 2 decimals
+    if (typeof tax !== "number" || !Number.isFinite(tax) || tax < 0 || tax > 28 || Math.abs(Math.round(tax * 100) - tax * 100) > 1e-6) {
+      bad("GST must be between 0 and 28%.");
+    }
+    out.taxPercent = tax;
+  }
+  if (Object.keys(out).length === 0) bad("Nothing to update.");
+  return out;
+}
 
 const toPublic = (r: Restaurant): PublicRestaurant => ({
   name: r.name, slug: r.slug, address: r.address, taxPercent: r.taxPercent, upiId: r.upiId,
@@ -151,7 +186,7 @@ app.post("/restaurants", requireUser, async (c) => {
   if (name.length < 2) bad("Enter your restaurant's name.");
   if (slug.length < 3) bad("The menu link needs at least 3 letters or numbers.");
   if (!Number.isInteger(tableCount) || tableCount < 1 || tableCount > 200) bad("Tables must be between 1 and 200.");
-  if (upiId && !/^[\w.\-]{2,}@[a-zA-Z]{2,}$/.test(upiId)) bad("UPI ID looks wrong. It should look like name@okaxis.");
+  if (upiId && !isValidUpiId(upiId)) bad(UPI_HINT);
 
   const repos = getRepos();
   if (await repos.restaurants.getMembership(c.get("userId"))) {
@@ -254,6 +289,15 @@ staff.patch("/menu/items/:id", allow(MANAGERS), async (c) => {
 staff.delete("/menu/items/:id", allow(MANAGERS), async (c) => {
   await getRepos().menu.deleteItem(c.get("membership").restaurant.id, c.req.param("id"));
   return c.body(null, 204);
+});
+
+staff.patch("/restaurant", allow(MANAGERS), async (c) => {
+  const patch = readRestaurantPatch(await body<UpdateRestaurantRequest>(c));
+  const repos = getRepos();
+  // Always the logged-in member's own restaurant; the client never chooses which one.
+  await repos.restaurants.update(c.get("membership").restaurant.id, patch);
+  const fresh = await repos.restaurants.getMembership(c.get("userId"));
+  return c.json(fresh!.restaurant);
 });
 
 staff.get("/tables", allow(MANAGERS), async (c) => {
