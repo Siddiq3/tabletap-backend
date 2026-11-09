@@ -96,7 +96,7 @@ export function supabaseRepos(db: SupabaseClient): Repos {
       async addCategory(restaurantId, name) {
         const row = ok(
           await db.from("menu_categories").insert({ restaurant_id: restaurantId, name, sort_order: Date.now() % 1e9 }).select().single(),
-        );
+        ) as Row;
         return toCategory(row);
       },
 
@@ -114,7 +114,7 @@ export function supabaseRepos(db: SupabaseClient): Repos {
             })
             .select()
             .single(),
-        );
+        ) as Row;
         return toItem(row);
       },
 
