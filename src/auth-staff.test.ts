@@ -60,6 +60,7 @@ async function fakeBackend() {
   const pub = ({ id, name, role, isActive }: Row): StaffMember => ({ id, name, role, isActive });
   const repos = {
     restaurants: { getMembership: async () => owner },
+    profiles: { get: async () => null }, // account from before v3: no email gate
     menu: { addCategory: async (_: string, name: string) => ({ id: "c1", name, sortOrder: 0 }) },
     staff: {
       list: async () => [...staff.values()].map(pub),

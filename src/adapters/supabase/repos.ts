@@ -215,6 +215,40 @@ export function supabaseRepos(db: SupabaseClient): Repos {
           }),
         );
       },
+
+      async markEmailVerified(userId) {
+        ok(await db.from("user_profiles").update({ email_verified_at: new Date().toISOString() }).eq("user_id", userId));
+      },
+    },
+
+    emailCodes: {
+      async create(userId, codeHash, expiresAt) {
+        const dayAgo = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+        ok(await db.from("email_verification_codes").delete().eq("user_id", userId).lt("created_at", dayAgo));
+        ok(await db.from("email_verification_codes").insert({ user_id: userId, code_hash: codeHash, expires_at: expiresAt }));
+      },
+
+      async sentSince(userId, sinceIso) {
+        const rows = ok(
+          await db
+            .from("email_verification_codes")
+            .select("created_at")
+            .eq("user_id", userId)
+            .gte("created_at", sinceIso)
+            .order("created_at", { ascending: false }),
+        ) as Row[];
+        return rows.map((r) => r.created_at);
+      },
+
+      async claimAttempt(userId) {
+        const rows = ok(await db.rpc("claim_verification_attempt", { p_user_id: userId })) as Row[];
+        const r = rows[0];
+        return r ? { codeHash: r.out_code_hash, attemptsLeft: r.out_attempts_left } : null;
+      },
+
+      async deleteAll(userId) {
+        ok(await db.from("email_verification_codes").delete().eq("user_id", userId));
+      },
     },
 
     staff: {

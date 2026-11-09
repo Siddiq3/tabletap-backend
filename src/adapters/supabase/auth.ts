@@ -58,8 +58,14 @@ export const supabaseAuth: AuthProvider = {
     return { accessToken: data.session.access_token, refreshToken: data.session.refresh_token };
   },
 
-  async sendPasswordReset(email) {
-    const { error } = await throwaway().auth.resetPasswordForEmail(email, { redirectTo: env("PASSWORD_RESET_URL") });
-    if (error) console.error("resetPasswordForEmail", error.message);
+  async createPasswordResetLink(email) {
+    // generateLink returns the link without Supabase emailing anything; our Mailer sends it.
+    const { data, error } = await supabase().auth.admin.generateLink({
+      type: "recovery",
+      email,
+      options: { redirectTo: env("PASSWORD_RESET_URL") },
+    });
+    if (error) return null; // no such user (or Supabase refused): the caller says the same thing either way
+    return data.properties.action_link;
   },
 };

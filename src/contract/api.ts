@@ -75,6 +75,15 @@ export interface AuthResponse {
   session: AuthSession;
 }
 
+export interface VerifyEmailRequest {
+  code: string;
+}
+
+/** After a code is sent: when "Resend code" can be tapped again. */
+export interface ResendCodeResponse {
+  retryAfterSeconds: number;
+}
+
 export interface ForgotPasswordResponse {
   /** false → the account has no real email; show `message` (contact support). */
   emailSent: boolean;
@@ -136,10 +145,12 @@ export type MenuItemPatch = Partial<NewMenuItem & { isAvailable: boolean }>;
 export interface ApiErrorBody {
   error: string;
   code?: string;
+  /** 429 on "Resend code": seconds until it's allowed again. */
+  retryAfterSeconds?: number;
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string, public code?: string) {
+  constructor(public status: number, message: string, public code?: string, public retryAfterSeconds?: number) {
     super(message);
   }
 }
@@ -148,6 +159,8 @@ const enc = encodeURIComponent;
 
 /** Error code when the X-Staff-Session token is expired/revoked: go back to "Who's working?", don't log out. */
 export const STAFF_SESSION_ERROR = "STAFF_SESSION";
+/** Error code (403) when the account's email isn't verified yet: show the "Check your email" screen. */
+export const EMAIL_UNVERIFIED_ERROR = "EMAIL_UNVERIFIED";
 
 /**
  * getStaffSession: the active PIN session token on a shared device, if any. When it returns a token,
@@ -182,7 +195,7 @@ export function createApiClient(
     const data = res.status === 204 ? null : await res.json().catch(() => null);
     if (!res.ok) {
       const err = (data ?? {}) as Partial<ApiErrorBody>;
-      throw new ApiError(res.status, err.error ?? "Something went wrong. Try again.", err.code);
+      throw new ApiError(res.status, err.error ?? "Something went wrong. Try again.", err.code, err.retryAfterSeconds);
     }
     return data as T;
   }
@@ -199,6 +212,9 @@ export function createApiClient(
     signup: (body: SignupRequest) => call<AuthResponse>("POST", "/auth/signup", body),
     login: (body: LoginRequest) => call<AuthResponse>("POST", "/auth/login", body),
     forgotPassword: (identifier: string) => call<ForgotPasswordResponse>("POST", "/auth/forgot-password", { identifier }),
+    // logged in, email not verified yet
+    verifyEmail: (code: string) => call<null>("POST", "/auth/verify-email", { code } satisfies VerifyEmailRequest),
+    resendCode: () => call<ResendCodeResponse>("POST", "/auth/resend-code"),
 
     // signed-in
     me: () => call<MeResponse>("GET", "/me"),

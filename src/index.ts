@@ -2,6 +2,9 @@
 // For AWS Lambda later: export `handle(app)` from "hono/aws-lambda" in a lambda.ts file instead.
 import { serve } from "@hono/node-server";
 import { app } from "./app";
+import { getMailer } from "./adapters";
+
+getMailer(); // fail at startup, not at the first signup, when MAILER/RESEND_API_KEY/MAIL_FROM are missing
 
 const port = Number(process.env.PORT ?? 4000);
 serve({ fetch: app.fetch, port }, (info) => {

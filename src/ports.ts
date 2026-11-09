@@ -36,8 +36,20 @@ export interface OrderRepo {
 export interface ProfileRepo {
   find(id: LoginIdentifier): Promise<(UserProfile & { userId: string }) | null>;
   get(userId: string): Promise<UserProfile | null>;
-  /** Throws DomainError USERNAME_TAKEN / EMAIL_TAKEN / PHONE_TAKEN on a clash. */
-  create(userId: string, profile: UserProfile): Promise<void>;
+  /** Throws DomainError USERNAME_TAKEN / EMAIL_TAKEN / PHONE_TAKEN on a clash. A new email starts unverified. */
+  create(userId: string, profile: Omit<UserProfile, "emailVerified">): Promise<void>;
+  markEmailVerified(userId: string): Promise<void>;
+}
+
+/** 6-digit email codes. One row per code sent; only the newest is live. */
+export interface EmailCodeRepo {
+  /** Stores a new code (it replaces any older one) and drops rows older than a day. */
+  create(userId: string, codeHash: string, expiresAt: string): Promise<void>;
+  /** created_at of codes sent since `sinceIso`, newest first (for resend limits). */
+  sentSince(userId: string, sinceIso: string): Promise<string[]>;
+  /** Atomically counts one attempt on the newest live code. Null = none, expired or 5 attempts used. */
+  claimAttempt(userId: string): Promise<{ codeHash: string; attemptsLeft: number } | null>;
+  deleteAll(userId: string): Promise<void>;
 }
 
 export interface StaffRepo {
@@ -63,6 +75,7 @@ export interface Repos {
   orders: OrderRepo;
   profiles: ProfileRepo;
   staff: StaffRepo;
+  emailCodes: EmailCodeRepo;
 }
 
 /** Turns a login token from web or app into a user id, or null if invalid/expired. */
@@ -80,6 +93,12 @@ export interface AuthProvider extends AuthVerifier {
   deleteUser(userId: string): Promise<void>;
   /** Null on any failure (wrong password, unknown user); never says which. */
   signInWithPassword(who: { userId: string } | { email: string }, password: string): Promise<AuthSession | null>;
-  /** Silent when the email has no account. */
-  sendPasswordReset(email: string): Promise<void>;
+  /** Reset link for the Mailer to send (the provider sends nothing). Null when the email has no account. */
+  createPasswordResetLink(email: string): Promise<string | null>;
+}
+
+/** Outgoing email. The provider's own emails are never used, so moving off Supabase changes nothing here. */
+export interface Mailer {
+  sendVerificationCode(to: string, code: string): Promise<void>;
+  sendPasswordReset(to: string, link: string): Promise<void>;
 }
