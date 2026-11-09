@@ -112,4 +112,6 @@ export interface UserProfile {
   username: string;
   email: string | null;
   phone: string | null;
+  /** False until the 6-digit email code is entered. Phone-only accounts: true (nothing to verify yet). Added in v4. */
+  emailVerified: boolean;
 }

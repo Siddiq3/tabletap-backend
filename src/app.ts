@@ -3,14 +3,15 @@ import { cors } from "hono/cors";
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import {
-  CONTRACT_VERSION, DomainError, PASSWORD_MIN, STAFF_SESSION_ERROR, canMoveTo, detectIdentifier, isValidEmail,
+  CONTRACT_VERSION, DomainError, EMAIL_UNVERIFIED_ERROR, PASSWORD_MIN, RESEND_CODE_SECONDS, isValidEmailCode, STAFF_SESSION_ERROR, canMoveTo, detectIdentifier, isValidEmail,
   isValidPin, isValidUpiId, isValidUsername, normalizeIndianPhone, slugify,
   type CreateRestaurantRequest, type LoginRequest, type Membership, type MenuItemPatch, type NewMenuItem,
   type NewStaffRequest, type OrderStatus, type PaymentMethod, type PinSessionRequest, type PlaceOrderRequest,
   type PublicRestaurant, type Restaurant, type Role, type SignupRequest, type StaffMember, type StaffPatch,
   type StaffRole, type UpdateRestaurantRequest,
 } from "./contract";
-import { getAuth, getRepos } from "./adapters";
+import { randomInt } from "node:crypto";
+import { getAuth, getMailer, getRepos } from "./adapters";
 import { clientIp, limiter, rateLimit } from "./rate-limit";
 import { hashPin, hashToken, newToken, verifyPin } from "./pin";
 
@@ -196,6 +197,10 @@ app.post("/auth/signup", rateLimit(10, 60 * 60_000, "Too many sign-ups from this
   }
   const session = await auth.signInWithPassword({ userId }, password);
   if (!session) throw new Error("signup: sign-in right after createUser failed");
+  if (profile.email) {
+    // The account exists either way; if this email fails, "Resend code" on the next screen sends another.
+    await sendEmailCode(userId, profile.email).catch((e) => console.error("signup verification email", e));
+  }
   return c.json({ session }, 201);
 });
 
@@ -221,13 +226,47 @@ app.post("/auth/forgot-password", rateLimit(5, 10 * 60_000, "Too many reset requ
   const id = detectIdentifier(String((await body<{ identifier: string }>(c)).identifier ?? ""));
   if (!id) bad("Enter your email, phone or username.");
   const profile = await getRepos().profiles.find(id!);
-  const email = profile ? profile.email : id!.kind === "email" ? id!.value : null;
-  if (profile && !email) {
+  if (profile && !profile.email) {
     return c.json({ emailSent: false, message: "Contact Tabletap support to reset your password." });
   }
-  if (email) await getAuth().sendPasswordReset(email);
+  // Only to an email the owner has proven. Accounts from before v3 (no profile) proved theirs with the
+  // old email-code login. Internal *.invalid login addresses never get mail.
+  const email = profile ? (profile.emailVerified ? profile.email : null) : id!.kind === "email" ? id!.value : null;
+  if (email && !email.endsWith(".invalid")) {
+    try {
+      const link = await getAuth().createPasswordResetLink(email);
+      if (link) await getMailer().sendPasswordReset(email, link);
+    } catch (e) {
+      console.error("password reset email", e); // same answer either way: never reveal whether it exists
+    }
+  }
   return c.json({ emailSent: true, message: "If that account exists, we've emailed a link to reset your password." });
 });
+
+// ---------- email verification (logged in, email not verified yet) ----------
+const CODE_TTL_MS = 10 * 60_000;
+const HOUR_MS = 60 * 60_000;
+const RESENDS_PER_HOUR = 5;
+
+/** Seconds until another code may be sent: 60 s between codes, at most 5 per hour. 0 = now. */
+export function resendWait(sentNewestFirst: string[], now = Date.now()): number {
+  const times = sentNewestFirst.map((t) => new Date(t).getTime()).filter((t) => t > now - HOUR_MS);
+  if (times.length === 0) return 0;
+  const gap = times[0] + RESEND_CODE_SECONDS * 1000 - now;
+  const hourly = times.length >= RESENDS_PER_HOUR ? times[RESENDS_PER_HOUR - 1] + HOUR_MS - now : 0;
+  return Math.max(0, Math.ceil(Math.max(gap, hourly) / 1000));
+}
+
+/** Sends a fresh code unless the resend limits say wait; returns seconds until the next one is allowed. */
+async function sendEmailCode(userId: string, email: string): Promise<{ wait: number; sent: boolean }> {
+  const repos = getRepos();
+  const wait = resendWait(await repos.emailCodes.sentSince(userId, new Date(Date.now() - HOUR_MS).toISOString()));
+  if (wait > 0) return { wait, sent: false };
+  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  await repos.emailCodes.create(userId, await hashPin(code), new Date(Date.now() + CODE_TTL_MS).toISOString());
+  await getMailer().sendVerificationCode(email, code);
+  return { wait: RESEND_CODE_SECONDS, sent: true };
+}
 
 // ---------- signed-in ----------
 const requireUser = createMiddleware<Env>(async (c, next) => {
@@ -237,6 +276,47 @@ const requireUser = createMiddleware<Env>(async (c, next) => {
   if (!userId) throw new HTTPException(401, { message: "Please log in again." });
   c.set("userId", userId);
   await next();
+});
+
+/** Owners who signed up with an email must verify it before using the restaurant. */
+const requireVerifiedEmail = createMiddleware<Env>(async (c, next) => {
+  const profile = await getRepos().profiles.get(c.get("userId"));
+  // No profile = account from before v3, which proved its email with the old email-code login.
+  if (profile && !profile.emailVerified) {
+    return c.json({ error: "Verify your email first. Enter the 6-digit code we sent you.", code: EMAIL_UNVERIFIED_ERROR }, 403);
+  }
+  await next();
+});
+
+app.post("/auth/verify-email", requireUser, async (c) => {
+  const code = String((await body<{ code: string }>(c)).code ?? "").trim();
+  const userId = c.get("userId");
+  const repos = getRepos();
+  const profile = await repos.profiles.get(userId);
+  if (!profile?.email) throw new HTTPException(409, { message: "This account has no email to verify." });
+  if (profile.emailVerified) return c.body(null, 204);
+  if (!isValidEmailCode(code)) bad("Enter the 6-digit code from the email.");
+  const claim = await repos.emailCodes.claimAttempt(userId);
+  if (!claim) bad("This code has expired or was tried too many times. Tap Resend code for a new one.");
+  if (!(await verifyPin(code, claim!.codeHash))) {
+    bad(claim!.attemptsLeft > 0
+      ? `Wrong code. ${claim!.attemptsLeft} ${claim!.attemptsLeft === 1 ? "try" : "tries"} left.`
+      : "Wrong code. Tap Resend code for a new one.");
+  }
+  await repos.profiles.markEmailVerified(userId);
+  await repos.emailCodes.deleteAll(userId);
+  return c.body(null, 204);
+});
+
+app.post("/auth/resend-code", requireUser, async (c) => {
+  const profile = await getRepos().profiles.get(c.get("userId"));
+  if (!profile?.email) throw new HTTPException(409, { message: "This account has no email to verify." });
+  if (profile.emailVerified) throw new HTTPException(409, { message: "Your email is already verified." });
+  const { wait, sent } = await sendEmailCode(c.get("userId"), profile.email);
+  if (!sent) {
+    return c.json({ error: `Wait ${wait} seconds before asking for another code.`, code: "RATE_LIMITED", retryAfterSeconds: wait }, 429);
+  }
+  return c.json({ retryAfterSeconds: wait });
 });
 
 const requireMember = createMiddleware<Env>(async (c, next) => {
@@ -284,7 +364,7 @@ app.get("/me", requireUser, async (c) => {
   return c.json({ userId: c.get("userId"), membership, profile });
 });
 
-app.post("/restaurants", requireUser, async (c) => {
+app.post("/restaurants", requireUser, requireVerifiedEmail, async (c) => {
   const b = await body<CreateRestaurantRequest>(c);
   const name = String(b.name ?? "").trim();
   const slug = slugify(String(b.slug ?? "") || name);
@@ -306,7 +386,7 @@ app.post("/restaurants", requireUser, async (c) => {
 
 // ---------- restaurant staff ----------
 const staff = new Hono<Env>();
-staff.use("*", requireUser, requireMember, applyStaffSession);
+staff.use("*", requireUser, requireVerifiedEmail, requireMember, applyStaffSession);
 const staffId = (c: { get: (k: "staff") => StaffMember | null }) => c.get("staff")?.id ?? null;
 
 staff.get("/orders", async (c) => {

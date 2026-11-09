@@ -113,5 +113,9 @@ export function detectIdentifier(raw: string): LoginIdentifier | null {
 
 export const isValidPin = (pin: string): boolean => /^\d{4,6}$/.test(pin);
 
+export const isValidEmailCode = (code: string): boolean => /^\d{6}$/.test(code);
+/** Wait this long between "Resend code" taps. The server enforces it (and 5 per hour). */
+export const RESEND_CODE_SECONDS = 60;
+
 /** Shared devices lock back to "Who's working?" after this long without a tap. */
 export const STAFF_IDLE_LOCK_MS = 10 * 60_000;

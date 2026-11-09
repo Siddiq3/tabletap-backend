@@ -81,4 +81,5 @@ export const toProfile = (r: Row): UserProfile => ({
   username: r.username,
   email: r.email ?? null,
   phone: r.phone ?? null,
+  emailVerified: !r.email || !!r.email_verified_at,
 });
