@@ -11,6 +11,7 @@ export class DomainError extends Error {
 }
 
 export const ERROR_MESSAGES: Record<string, string> = {
+  STAFF_CALL_COOLDOWN: "Please wait 30 seconds before calling staff again.",
   EMPTY_ORDER: "Your cart is empty. Add a dish first.",
   INVALID_TABLE: "This table QR is not active. Ask the staff for help.",
   ITEM_UNAVAILABLE: "A dish in your cart just sold out. Remove it and try again.",

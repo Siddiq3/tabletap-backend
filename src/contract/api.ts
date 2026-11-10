@@ -7,7 +7,7 @@
 // (Supabase today, AWS later) without touching either client.
 import type {
   DiningTable, Membership, Menu, MenuCategory, MenuItem, NewMenuItem, Order, OrderStatus, PaymentMethod, Restaurant,
-  StaffMember, StaffRole, UserProfile,
+  StaffCall, StaffMember, StaffRole, UserProfile,
 } from "./types";
 
 export interface PublicRestaurant {
@@ -207,6 +207,10 @@ export function createApiClient(
     placeOrder: (body: PlaceOrderRequest) => call<PlaceOrderResponse>("POST", "/public/orders", body),
     publicOrder: (slug: string, orderId: string) =>
       call<PublicOrderResponse>("GET", `/public/r/${enc(slug)}/orders/${enc(orderId)}`),
+
+    callStaff: (slug: string, tableId: string) => call<{ call: StaffCall }>("POST", `/public/r/${enc(slug)}/staff-calls`, { tableId }),
+    staffCalls: () => call<{ calls: StaffCall[] }>("GET", "/staff/calls"),
+    resolveStaffCall: (id: string) => call<null>("POST", `/staff/calls/${enc(id)}/resolve`),
 
     // owner/manager login (no token needed)
     signup: (body: SignupRequest) => call<AuthResponse>("POST", "/auth/signup", body),
