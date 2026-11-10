@@ -27,7 +27,7 @@ type Env = {
   };
 };
 
-const UUID = /^[0-9a-f-]{36}$/i;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MANAGERS: Role[] = ["owner", "manager"];
 const CASHIERS: Role[] = ["owner", "manager", "cashier"];
 const STATUSES: OrderStatus[] = ["new", "preparing", "ready", "served", "cancelled"];
@@ -158,6 +158,20 @@ app.get("/public/r/:slug/orders/:id", async (c) => {
   if (!order) notFound();
   c.header("Cache-Control", "no-store");
   return c.json({ restaurant: toPublic(restaurant!), order });
+});
+
+// Guest requests are validated against an active table; the database coalesces repeat taps.
+app.post("/public/r/:slug/staff-calls", rateLimit(10, 60_000, "Too many staff calls. Please wait a minute."), async (c) => {
+  const { tableId } = await body<{ tableId: string }>(c);
+  if (typeof tableId !== "string" || !UUID.test(tableId)) bad("Scan the QR code on your table to call staff.");
+  const repos = getRepos();
+  const restaurant = await repos.restaurants.getBySlug(c.req.param("slug"));
+  if (!restaurant || restaurant.plan === "suspended") notFound("Restaurant not found.");
+  const table = await repos.restaurants.getTable(restaurant!.id, tableId!);
+  if (!table?.isActive) bad("This table is not active. Please ask the staff for help.");
+  const call = await repos.staffCalls.request(restaurant!.id, tableId!);
+  c.header("Cache-Control", "no-store");
+  return c.json({ call });
 });
 
 // ---------- owner/manager login ----------
@@ -388,6 +402,19 @@ app.post("/restaurants", requireUser, requireVerifiedEmail, async (c) => {
 const staff = new Hono<Env>();
 staff.use("*", requireUser, requireVerifiedEmail, requireMember, applyStaffSession);
 const staffId = (c: { get: (k: "staff") => StaffMember | null }) => c.get("staff")?.id ?? null;
+
+staff.get("/calls", async (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json({ calls: await getRepos().staffCalls.listPending(c.get("membership").restaurant.id) });
+});
+
+staff.post("/calls/:id/resolve", async (c) => {
+  const id = c.req.param("id");
+  if (!UUID.test(id)) bad("Unknown staff call.");
+  const resolved = await getRepos().staffCalls.resolve(c.get("membership").restaurant.id, id, staffId(c));
+  if (!resolved) notFound("This call was already handled or is not available.");
+  return c.body(null, 204);
+});
 
 staff.get("/orders", async (c) => {
   const orders = await getRepos().orders.listBoard(c.get("membership").restaurant.id);

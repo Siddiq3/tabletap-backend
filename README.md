@@ -16,7 +16,7 @@ It's the only part of Tabletap that talks to the database. Web: `tabletap-web`. 
 ## Setup
 
 1. Create a Supabase project (Mumbai region).
-2. SQL Editor: run `db/migrations/` in order (0001 → 0006). 0002, 0004 and 0006 are Supabase-only security.
+2. SQL Editor: run `db/migrations/` in order (0001 → 0008). 0002, 0004, 0006 and 0008 are Supabase-only security.
 3. Authentication → URL Configuration → Redirect URLs: add `PASSWORD_RESET_URL` (the web's `/reset-password`).
 4. `cp .env.example .env` and fill it in.
 5. `npm install` then `npm run dev` → http://localhost:4000/health
@@ -29,7 +29,7 @@ Set `CORS_ORIGINS` to your web domain(s).
 ## Folders
 
 ```
-db/migrations/      plain PostgreSQL; 0002, 0004 and 0006 are Supabase-only security
+db/migrations/      plain PostgreSQL; 0002, 0004, 0006 and 0008 are Supabase-only security
 src/app.ts          all API routes
 src/ports.ts        what the API needs from storage and login
 src/adapters/       Supabase today; add aws/ later
@@ -40,3 +40,14 @@ docs/               ARCHITECTURE.md, BRANCHING.md
 ## Backups
 
 `npm run db:backup` writes a full `pg_dump` that restores into any PostgreSQL, including AWS RDS.
+
+## Guest calls for assistance
+
+Apply `0007_staff_calls.sql` followed by `0008_staff_calls_security.sql` in Supabase before using this feature. 0007 is portable PostgreSQL; 0008 sets Supabase RLS, grants and realtime publication. API contract version is 5 in all three clients.
+
+- `POST /public/r/:slug/staff-calls` with `{ tableId }` creates a call for an active table. Guests need the table QR; menu-only viewers cannot call. Suspended restaurants and foreign/inactive tables are rejected.
+- A database row lock and partial unique index keep one pending call per table. A new call after handling has a 30-second cooldown measured from the preceding request. The public endpoint also allows at most 10 requests per IP per minute.
+- `GET /staff/calls` lists pending calls for the authenticated restaurant. `POST /staff/calls/:id/resolve` marks a call handled and records the active PIN staff member when present. The existing verified-account, membership and PIN-session checks apply. Direct browser writes and cross-restaurant reads are denied by RLS.
+- Web and mobile orders screens subscribe to changes and use a 5-second polling fallback. The web has an **Enable call sound** control; mobile vibrates on new call IDs. These are foreground alerts, not background push notifications.
+
+Tests: `node --import tsx --test src/*.test.ts`. `db/tests/staff_calls.sql` exercises duplicate prevention, table validation, cooldown, restaurant suspension and RLS after all migrations on a disposable PostgreSQL database; it rolls back its test rows. The local test run also verified 20 concurrent requests produce one pending call. Real Supabase realtime delivery requires configured project credentials.

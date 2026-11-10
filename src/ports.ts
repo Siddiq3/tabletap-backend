@@ -1,7 +1,7 @@
 // Ports: what the API needs from storage and login. One folder in src/adapters per backend.
 import type {
   AuthSession, DiningTable, Menu, MenuCategory, MenuItem, Membership, NewMenuItem, NewRestaurant,
-  LoginIdentifier, Order, OrderStatus, PaymentMethod, PlaceOrderInput, Restaurant, StaffMember, StaffRole, UserProfile,
+  LoginIdentifier, Order, OrderStatus, PaymentMethod, PlaceOrderInput, Restaurant, StaffCall, StaffMember, StaffRole, UserProfile,
 } from "./contract";
 
 export interface RestaurantRepo {
@@ -69,7 +69,14 @@ export interface StaffRepo {
   revokeSessions(staffId: string): Promise<void>;
 }
 
+export interface StaffCallRepo {
+  request(restaurantId: string, tableId: string): Promise<StaffCall>;
+  listPending(restaurantId: string): Promise<StaffCall[]>;
+  resolve(restaurantId: string, callId: string, staffId: string | null): Promise<boolean>;
+}
+
 export interface Repos {
+  staffCalls: StaffCallRepo;
   restaurants: RestaurantRepo;
   menu: MenuRepo;
   orders: OrderRepo;

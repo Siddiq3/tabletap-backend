@@ -1,5 +1,5 @@
 // Database rows (snake_case) → domain objects (camelCase). The only place that knows column names.
-import type { DiningTable, MenuCategory, MenuItem, Order, Restaurant, Role, StaffMember, UserProfile } from "../../contract";
+import type { DiningTable, MenuCategory, MenuItem, Order, Restaurant, Role, StaffCall, StaffMember, UserProfile } from "../../contract";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Row = Record<string, any>;
@@ -83,3 +83,6 @@ export const toProfile = (r: Row): UserProfile => ({
   phone: r.phone ?? null,
   emailVerified: !r.email || !!r.email_verified_at,
 });
+
+export const STAFF_CALL_SELECT = "id, table_id, created_at, resolved_at, dining_tables(label)";
+export const toStaffCall = (r: Row): StaffCall => ({ id: r.id, tableId: r.table_id, tableLabel: r.dining_tables?.label ?? "Unknown table", createdAt: r.created_at, resolvedAt: r.resolved_at ?? null });

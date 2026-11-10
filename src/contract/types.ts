@@ -115,3 +115,12 @@ export interface UserProfile {
   /** False until the 6-digit email code is entered. Phone-only accounts: true (nothing to verify yet). Added in v4. */
   emailVerified: boolean;
 }
+
+/** A guest asking for assistance at a table. Resolved calls leave the staff inbox. */
+export interface StaffCall {
+  id: string;
+  tableId: string;
+  tableLabel: string;
+  createdAt: string;
+  resolvedAt: string | null;
+}

@@ -1,7 +1,7 @@
 import type { SupabaseClient, PostgrestError } from "@supabase/supabase-js";
 import type { Repos } from "../../ports";
 import { DomainError, ERROR_MESSAGES, startOfTodayIST } from "../../contract";
-import { ORDER_SELECT, STAFF_SELECT, toCategory, toItem, toOrder, toProfile, toRestaurant, toStaff, toTable, type Row } from "./mappers";
+import { ORDER_SELECT, STAFF_SELECT, STAFF_CALL_SELECT, toStaffCall, toCategory, toItem, toOrder, toProfile, toRestaurant, toStaff, toTable, type Row } from "./mappers";
 
 function fail(error: PostgrestError): never {
   const code = Object.keys(ERROR_MESSAGES).find((c) => error.message.includes(c));
@@ -23,6 +23,20 @@ function ok<T>(res: { data: T | null; error: PostgrestError | null }): T {
 
 export function supabaseRepos(db: SupabaseClient): Repos {
   return {
+    staffCalls: {
+      async request(restaurantId, tableId) {
+        const id = ok(await db.rpc("request_staff_call", { p_restaurant_id: restaurantId, p_table_id: tableId })) as string;
+        return toStaffCall(ok(await db.from("staff_calls").select(STAFF_CALL_SELECT).eq("restaurant_id", restaurantId).eq("id", id).single()));
+      },
+      async listPending(restaurantId) {
+        const rows = ok(await db.from("staff_calls").select(STAFF_CALL_SELECT).eq("restaurant_id", restaurantId).is("resolved_at", null).order("created_at")) as Row[];
+        return rows.map(toStaffCall);
+      },
+      async resolve(restaurantId, callId, staffId) {
+        const row = ok(await db.from("staff_calls").update({ resolved_at: new Date().toISOString(), resolved_by_staff_id: staffId }).eq("restaurant_id", restaurantId).eq("id", callId).is("resolved_at", null).select("id").maybeSingle());
+        return !!row;
+      },
+    },
     restaurants: {
       async getBySlug(slug) {
         const row = ok(await db.from("restaurants").select("*").eq("slug", slug).maybeSingle());
