@@ -1,7 +1,7 @@
 // Ports: what the API needs from storage and login. One folder in src/adapters per backend.
 import type {
-  AuthSession, DiningTable, Menu, MenuCategory, MenuItem, Membership, NewMenuItem, NewRestaurant,
-  LoginIdentifier, Order, OrderStatus, PaymentMethod, PlaceOrderInput, Restaurant, StaffCall, StaffMember, StaffRole, UserProfile,
+  AuthSession, Bill, DiningTable, Menu, MenuCategory, MenuItem, Membership, NewMenuItem, NewRestaurant,
+  LoginIdentifier, Order, OrderStatus, PaymentMethod, Restaurant, SalesReport, StaffCall, StaffMember, StaffRole, UserProfile,
 } from "./contract";
 
 export interface RestaurantRepo {
@@ -9,7 +9,7 @@ export interface RestaurantRepo {
   getMembership(userId: string): Promise<Membership | null>;
   slugTaken(slug: string): Promise<boolean>;
   create(input: NewRestaurant, ownerUserId: string): Promise<string>;
-  update(restaurantId: string, patch: Partial<Pick<Restaurant, "name" | "address" | "upiId" | "taxPercent">>): Promise<void>;
+  update(restaurantId: string, patch: Partial<Pick<Restaurant, "name" | "address" | "upiId" | "taxPercent" | "gstin" | "fssai" | "serviceChargePercent" | "packagingPaise">>): Promise<void>;
   listTables(restaurantId: string): Promise<DiningTable[]>;
   getTable(restaurantId: string, tableId: string): Promise<DiningTable | null>;
   addTables(restaurantId: string, labels: string[]): Promise<void>;
@@ -23,14 +23,45 @@ export interface MenuRepo {
   deleteItem(restaurantId: string, itemId: string): Promise<void>;
 }
 
+/** Where an order goes: a table (its open bill, created if needed), a specific open bill, or a new takeaway bill. */
+export interface NewOrder {
+  restaurantId: string;
+  tableId?: string;
+  billId?: string;
+  takeaway?: { customerName?: string; customerPhone?: string };
+  items: { menuItemId: string; qty: number }[];
+  note?: string;
+  source: "qr" | "staff";
+  /** PIN staff member who added it; null for guests and the owner/manager's own login. */
+  staffId: string | null;
+}
+
 export interface OrderRepo {
-  place(input: PlaceOrderInput): Promise<{ orderId: string; orderNo: number; totalPaise: number }>;
+  place(input: NewOrder): Promise<{ orderId: string; orderNo: number; totalPaise: number; billId: string }>;
   get(restaurantId: string, orderId: string): Promise<Order | null>;
   /** Open orders of any age, plus everything from today (IST). */
   listBoard(restaurantId: string): Promise<Order[]>;
   /** staffId: the PIN staff member acting, or null for the owner/manager's own login. */
   setStatus(restaurantId: string, orderId: string, status: OrderStatus, staffId: string | null): Promise<void>;
+  /** Pays one round against its bill (the last unpaid round settles the rest and closes the bill). */
   markPaid(restaurantId: string, orderId: string, method: PaymentMethod, staffId: string | null): Promise<void>;
+  /** Throws DomainError REASON_REQUIRED / ITEM_NOT_FOUND / INVALID_QTY / BILL_CLOSED. */
+  cancelItem(restaurantId: string, orderItemId: string, qty: number, reason: string, staffId: string | null): Promise<void>;
+}
+
+export interface BillRepo {
+  listOpen(restaurantId: string): Promise<Bill[]>;
+  get(restaurantId: string, billId: string): Promise<Bill | null>;
+  /** The open bill containing this order, or null once it is closed. */
+  openBillForOrder(restaurantId: string, orderId: string): Promise<Bill | null>;
+  /** Throws DomainError BILL_CHANGED (total moved), INVALID_PAYMENT_AMOUNT, BILL_CLOSED. */
+  pay(restaurantId: string, billId: string, p: { method: PaymentMethod; amountPaise: number; expectedTotalPaise: number }, staffId: string | null): Promise<void>;
+  /** False when the bill is not open. */
+  update(restaurantId: string, billId: string, patch: { discountPaise?: number; discountReason?: string | null; serviceChargeOn?: boolean }): Promise<boolean>;
+  move(restaurantId: string, billId: string, tableId: string): Promise<void>;
+  merge(restaurantId: string, fromBillId: string, intoBillId: string, staffId: string | null): Promise<void>;
+  void(restaurantId: string, billId: string, reason: string, staffId: string | null): Promise<void>;
+  salesReport(restaurantId: string, fromIso: string, toIso: string): Promise<SalesReport>;
 }
 
 export interface ProfileRepo {
@@ -76,6 +107,7 @@ export interface StaffCallRepo {
 }
 
 export interface Repos {
+  bills: BillRepo;
   staffCalls: StaffCallRepo;
   restaurants: RestaurantRepo;
   menu: MenuRepo;

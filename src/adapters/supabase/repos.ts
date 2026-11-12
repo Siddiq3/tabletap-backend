@@ -1,7 +1,7 @@
 import type { SupabaseClient, PostgrestError } from "@supabase/supabase-js";
 import type { Repos } from "../../ports";
-import { DomainError, ERROR_MESSAGES, startOfTodayIST } from "../../contract";
-import { ORDER_SELECT, STAFF_SELECT, STAFF_CALL_SELECT, toStaffCall, toCategory, toItem, toOrder, toProfile, toRestaurant, toStaff, toTable, type Row } from "./mappers";
+import { DomainError, ERROR_MESSAGES, makeBill, startOfTodayIST, type Bill } from "../../contract";
+import { BILL_SELECT, ORDER_SELECT, STAFF_SELECT, STAFF_CALL_SELECT, frozenAmounts, liveAmounts, toBillHeader, toPayment, toStaffCall, toCategory, toItem, toOrder, toProfile, toRestaurant, toStaff, toTable, type Row } from "./mappers";
 
 function fail(error: PostgrestError): never {
   const code = Object.keys(ERROR_MESSAGES).find((c) => error.message.includes(c));
@@ -22,7 +22,71 @@ function ok<T>(res: { data: T | null; error: PostgrestError | null }): T {
 }
 
 export function supabaseRepos(db: SupabaseClient): Repos {
+  /** Bills with their rounds and payments; open ones get live amounts from bill_amounts. */
+  async function loadBills(heads: Row[]): Promise<Bill[]> {
+    if (heads.length === 0) return [];
+    const ids = heads.map((h) => h.id);
+    const openIds = heads.filter((h) => h.status === "open").map((h) => h.id);
+    const [orders, payments, amounts] = await Promise.all([
+      db.from("orders").select(ORDER_SELECT).in("bill_id", ids).order("created_at"),
+      db.from("bill_payments").select("id, bill_id, method, amount_paise, created_at").in("bill_id", ids).order("created_at"),
+      openIds.length ? db.from("bill_amounts").select("*").in("bill_id", openIds) : Promise.resolve({ data: [], error: null }),
+    ]);
+    const orderRows = ok(orders) as Row[];
+    const payRows = ok(payments) as Row[];
+    const live = new Map((ok(amounts) as Row[]).map((a) => [a.bill_id, liveAmounts(a)]));
+    return heads.map((h) => makeBill(
+      toBillHeader(h),
+      h.status === "open" ? live.get(h.id)! : frozenAmounts(h),
+      orderRows.filter((o) => o.bill_id === h.id).map(toOrder),
+      payRows.filter((p) => p.bill_id === h.id).map(toPayment),
+    ));
+  }
+
   return {
+    bills: {
+      async listOpen(restaurantId) {
+        return loadBills(ok(await db.from("bills").select(BILL_SELECT).eq("restaurant_id", restaurantId).eq("status", "open").order("opened_at").limit(300)) as Row[]);
+      },
+      async get(restaurantId, billId) {
+        if (!isUuid(billId)) return null;
+        const row = ok(await db.from("bills").select(BILL_SELECT).eq("restaurant_id", restaurantId).eq("id", billId).maybeSingle());
+        return row ? (await loadBills([row as Row]))[0] : null;
+      },
+      async openBillForOrder(restaurantId, orderId) {
+        if (!isUuid(orderId)) return null;
+        const o = ok(await db.from("orders").select("bill_id").eq("restaurant_id", restaurantId).eq("id", orderId).maybeSingle()) as Row | null;
+        if (!o?.bill_id) return null;
+        const row = ok(await db.from("bills").select(BILL_SELECT).eq("id", o.bill_id).eq("status", "open").maybeSingle());
+        return row ? (await loadBills([row as Row]))[0] : null;
+      },
+      async pay(restaurantId, billId, p, staffId) {
+        ok(await db.rpc("add_bill_payment", {
+          p_restaurant_id: restaurantId, p_bill_id: billId, p_method: p.method,
+          p_amount_paise: p.amountPaise, p_expected_total: p.expectedTotalPaise, p_staff_id: staffId,
+        }));
+      },
+      async update(restaurantId, billId, patch) {
+        const row: Row = {};
+        if (patch.discountPaise !== undefined) row.discount_paise = patch.discountPaise;
+        if (patch.discountReason !== undefined) row.discount_reason = patch.discountReason;
+        if (patch.serviceChargeOn !== undefined) row.service_charge_on = patch.serviceChargeOn;
+        const done = ok(await db.from("bills").update(row).eq("restaurant_id", restaurantId).eq("id", billId).eq("status", "open").select("id").maybeSingle());
+        return !!done;
+      },
+      async move(restaurantId, billId, tableId) {
+        ok(await db.rpc("move_bill", { p_restaurant_id: restaurantId, p_bill_id: billId, p_to_table_id: tableId }));
+      },
+      async merge(restaurantId, fromBillId, intoBillId, staffId) {
+        ok(await db.rpc("merge_bills", { p_restaurant_id: restaurantId, p_from: fromBillId, p_into: intoBillId, p_staff_id: staffId }));
+      },
+      async void(restaurantId, billId, reason, staffId) {
+        ok(await db.rpc("void_bill", { p_restaurant_id: restaurantId, p_bill_id: billId, p_reason: reason, p_staff_id: staffId }));
+      },
+      async salesReport(restaurantId, fromIso, toIso) {
+        return ok(await db.rpc("sales_report", { p_restaurant_id: restaurantId, p_from: fromIso, p_to: toIso }));
+      },
+    },
     staffCalls: {
       async request(restaurantId, tableId) {
         const id = ok(await db.rpc("request_staff_call", { p_restaurant_id: restaurantId, p_table_id: tableId })) as string;
@@ -80,6 +144,10 @@ export function supabaseRepos(db: SupabaseClient): Repos {
         if (patch.address !== undefined) row.address = patch.address;
         if (patch.upiId !== undefined) row.upi_id = patch.upiId;
         if (patch.taxPercent !== undefined) row.tax_percent = patch.taxPercent;
+        if (patch.gstin !== undefined) row.gstin = patch.gstin;
+        if (patch.fssai !== undefined) row.fssai = patch.fssai;
+        if (patch.serviceChargePercent !== undefined) row.service_charge_percent = patch.serviceChargePercent;
+        if (patch.packagingPaise !== undefined) row.packaging_paise = patch.packagingPaise;
         ok(await db.from("restaurants").update(row).eq("id", restaurantId));
       },
 
@@ -157,15 +225,21 @@ export function supabaseRepos(db: SupabaseClient): Repos {
     orders: {
       async place(input) {
         const rows = ok(
-          await db.rpc("place_order", {
+          await db.rpc("add_order", {
             p_restaurant_id: input.restaurantId,
-            p_table_id: input.tableId,
+            p_table_id: input.tableId ?? null,
+            p_bill_id: input.billId ?? null,
             p_items: input.items.map((i) => ({ menu_item_id: i.menuItemId, qty: i.qty })),
             p_note: input.note ?? "",
+            p_source: input.source,
+            p_staff_id: input.staffId,
+            p_takeaway: !!input.takeaway,
+            p_customer_name: input.takeaway?.customerName ?? null,
+            p_customer_phone: input.takeaway?.customerPhone ?? null,
           }),
         ) as Row[];
         const r = rows[0];
-        return { orderId: r.out_order_id, orderNo: r.out_order_no, totalPaise: r.out_total_paise };
+        return { orderId: r.out_order_id, orderNo: r.out_order_no, totalPaise: r.out_total_paise, billId: r.out_bill_id };
       },
 
       async get(restaurantId, orderId) {
@@ -201,13 +275,11 @@ export function supabaseRepos(db: SupabaseClient): Repos {
       },
 
       async markPaid(restaurantId, orderId, method, staffId) {
-        ok(
-          await db
-            .from("orders")
-            .update({ payment_status: "paid", payment_method: method, paid_by_staff_id: staffId })
-            .eq("restaurant_id", restaurantId)
-            .eq("id", orderId),
-        );
+        ok(await db.rpc("mark_order_paid", { p_restaurant_id: restaurantId, p_order_id: orderId, p_method: method, p_staff_id: staffId }));
+      },
+
+      async cancelItem(restaurantId, orderItemId, qty, reason, staffId) {
+        ok(await db.rpc("cancel_order_item", { p_restaurant_id: restaurantId, p_order_item_id: orderItemId, p_qty: qty, p_reason: reason, p_staff_id: staffId }));
       },
     },
 

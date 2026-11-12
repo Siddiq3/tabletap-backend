@@ -3,12 +3,12 @@ import { cors } from "hono/cors";
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import {
-  CONTRACT_VERSION, DomainError, EMAIL_UNVERIFIED_ERROR, PASSWORD_MIN, RESEND_CODE_SECONDS, isValidEmailCode, STAFF_SESSION_ERROR, canMoveTo, detectIdentifier, isValidEmail,
+  CONTRACT_VERSION, DomainError, isValidFssai, isValidGstin, EMAIL_UNVERIFIED_ERROR, PASSWORD_MIN, RESEND_CODE_SECONDS, isValidEmailCode, STAFF_SESSION_ERROR, canMoveTo, detectIdentifier, isValidEmail,
   isValidPin, isValidUpiId, isValidUsername, normalizeIndianPhone, slugify,
   type CreateRestaurantRequest, type LoginRequest, type Membership, type MenuItemPatch, type NewMenuItem,
   type NewStaffRequest, type OrderStatus, type PaymentMethod, type PinSessionRequest, type PlaceOrderRequest,
   type PublicRestaurant, type Restaurant, type Role, type SignupRequest, type StaffMember, type StaffPatch,
-  type StaffRole, type UpdateRestaurantRequest,
+  type BillPatch, type BillPaymentRequest, type StaffOrderRequest, type StaffRole, type UpdateRestaurantRequest,
 } from "./contract";
 import { randomInt } from "node:crypto";
 import { getAuth, getMailer, getRepos } from "./adapters";
@@ -30,6 +30,8 @@ type Env = {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MANAGERS: Role[] = ["owner", "manager"];
 const CASHIERS: Role[] = ["owner", "manager", "cashier"];
+/** Everyone who serves guests can add items to a table; the kitchen only cooks. */
+const ORDER_TAKERS: Role[] = ["owner", "manager", "cashier", "waiter"];
 const STATUSES: OrderStatus[] = ["new", "preparing", "ready", "served", "cancelled"];
 const METHODS: PaymentMethod[] = ["upi", "cash", "card", "online"];
 const STAFF_ROLES: StaffRole[] = ["manager", "cashier", "kitchen", "waiter"];
@@ -48,7 +50,7 @@ const body = async <T>(c: { req: { json: () => Promise<unknown> } }): Promise<Pa
 
 const UPI_HINT = "UPI ID looks wrong. It should look like name@okaxis.";
 
-type RestaurantPatch = Partial<Pick<Restaurant, "name" | "address" | "upiId" | "taxPercent">>;
+type RestaurantPatch = Partial<Pick<Restaurant, "name" | "address" | "upiId" | "taxPercent" | "gstin" | "fssai" | "serviceChargePercent" | "packagingPaise">>;
 
 /** Validates PATCH /staff/restaurant. Only fields that were sent are changed; "" removes address or UPI ID. */
 export function readRestaurantPatch(b: Partial<UpdateRestaurantRequest>): RestaurantPatch {
@@ -75,6 +77,26 @@ export function readRestaurantPatch(b: Partial<UpdateRestaurantRequest>): Restau
       bad("GST must be between 0 and 28%.");
     }
     out.taxPercent = tax;
+  }
+  if (b.gstin !== undefined) {
+    const gstin = String(b.gstin ?? "").trim().toUpperCase();
+    if (gstin && !isValidGstin(gstin)) bad("GSTIN should be 15 characters, like 29ABCDE1234F1Z5.");
+    out.gstin = gstin || null;
+  }
+  if (b.fssai !== undefined) {
+    const fssai = String(b.fssai ?? "").replace(/\s/g, "");
+    if (fssai && !isValidFssai(fssai)) bad("FSSAI licence number is 14 digits.");
+    out.fssai = fssai || null;
+  }
+  if (b.serviceChargePercent !== undefined) {
+    const v = b.serviceChargePercent;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 20 || Math.abs(Math.round(v * 100) - v * 100) > 1e-6) bad("Service charge must be between 0 and 20%.");
+    out.serviceChargePercent = v;
+  }
+  if (b.packagingPaise !== undefined) {
+    const v = b.packagingPaise;
+    if (!Number.isInteger(v) || v < 0 || v > 100000) bad("Packaging charge must be between ₹0 and ₹1,000.");
+    out.packagingPaise = v;
   }
   if (Object.keys(out).length === 0) bad("Nothing to update.");
   return out;
@@ -127,26 +149,44 @@ app.get("/public/r/:slug", async (c) => {
   });
 });
 
+const CART_ERROR = "The order could not be read. Refresh the page and try again.";
+
+/** Same item checks for a guest's cart and for items staff add; prices always come from the database. */
+function readItems(b: { items?: unknown; note?: unknown }) {
+  const items = (Array.isArray(b.items) ? b.items : []) as { menuItemId: string; qty: number }[];
+  const valid = items.length > 0 && items.length <= 60 &&
+    items.every((i) => i && typeof i.menuItemId === "string" && UUID.test(i.menuItemId) && Number.isInteger(i.qty) && i.qty >= 1 && i.qty <= 50);
+  if (!valid) bad(CART_ERROR);
+  return { items: items.map((i) => ({ menuItemId: i.menuItemId, qty: i.qty })), note: typeof b.note === "string" ? b.note.slice(0, 300) : "" };
+}
+
+/** Staff orders go to exactly one place: a table, an open bill, or a new takeaway. */
+function readStaffOrder(b: Partial<StaffOrderRequest>) {
+  const targets = [b.tableId !== undefined, b.billId !== undefined, b.takeaway !== undefined].filter(Boolean).length;
+  if (targets !== 1) bad("Choose a table, a bill or takeaway for this order.");
+  if (b.tableId !== undefined && !(typeof b.tableId === "string" && UUID.test(b.tableId))) bad("Unknown table.");
+  if (b.billId !== undefined && !(typeof b.billId === "string" && UUID.test(b.billId))) bad("Unknown bill.");
+  let takeaway: { customerName?: string; customerPhone?: string } | undefined;
+  if (b.takeaway !== undefined) {
+    const name = String(b.takeaway?.customerName ?? "").trim();
+    const phone = String(b.takeaway?.customerPhone ?? "").replace(/[\s-]/g, "");
+    if (name.length > 60) bad("Customer name is too long.");
+    if (phone && !/^\+?[0-9]{6,14}$/.test(phone)) bad("Enter a valid phone number, or leave it empty.");
+    takeaway = { customerName: name || undefined, customerPhone: phone || undefined };
+  }
+  return { tableId: b.tableId, billId: b.billId, takeaway, ...readItems(b) };
+}
+
 app.post("/public/orders", rateLimit(15, 60_000), async (c) => {
   const b = await body<PlaceOrderRequest>(c);
-  const items = Array.isArray(b.items) ? b.items : [];
-  const valid =
-    typeof b.slug === "string" &&
-    typeof b.tableId === "string" && UUID.test(b.tableId) &&
-    items.length > 0 && items.length <= 60 &&
-    items.every((i) => i && typeof i.menuItemId === "string" && UUID.test(i.menuItemId) && Number.isInteger(i.qty) && i.qty >= 1 && i.qty <= 50);
-  if (!valid) bad("Your cart could not be read. Refresh the page and try again.");
+  if (typeof b.slug !== "string" || typeof b.tableId !== "string" || !UUID.test(b.tableId)) bad(CART_ERROR);
+  const cart = { tableId: b.tableId as string, ...readItems(b) };
 
   const repos = getRepos();
   const restaurant = await repos.restaurants.getBySlug(b.slug as string);
   if (!restaurant) notFound("Restaurant not found.");
 
-  const placed = await repos.orders.place({
-    restaurantId: restaurant!.id,
-    tableId: b.tableId as string,
-    items: items.map((i) => ({ menuItemId: i.menuItemId, qty: i.qty })),
-    note: typeof b.note === "string" ? b.note.slice(0, 300) : "",
-  });
+  const placed = await repos.orders.place({ restaurantId: restaurant!.id, ...cart, source: "qr", staffId: null });
   return c.json(placed, 201);
 });
 
@@ -158,6 +198,18 @@ app.get("/public/r/:slug/orders/:id", async (c) => {
   if (!order) notFound();
   c.header("Cache-Control", "no-store");
   return c.json({ restaurant: toPublic(restaurant!), order });
+});
+
+// The guest's table bill (all rounds, QR and waiter) so they can pay once. Only while their own
+// order is still on the open bill: after settling, later diners' orders at the table stay private.
+app.get("/public/r/:slug/orders/:id/bill", async (c) => {
+  const repos = getRepos();
+  const restaurant = await repos.restaurants.getBySlug(c.req.param("slug"));
+  if (!restaurant) notFound();
+  const id = c.req.param("id");
+  c.header("Cache-Control", "no-store");
+  if (!(await repos.orders.get(restaurant!.id, id))) notFound();
+  return c.json({ bill: await repos.bills.openBillForOrder(restaurant!.id, id) });
 });
 
 // Guest requests are validated against an active table; the database coalesces repeat taps.
@@ -421,6 +473,112 @@ staff.get("/orders", async (c) => {
   return c.json({ orders });
 });
 
+// ---------- bills ----------
+// A guest asks the waiter for more, a walk-in orders at the counter, or a takeaway: all join a bill.
+staff.post("/orders", allow(ORDER_TAKERS), async (c) => {
+  const order = readStaffOrder(await body<StaffOrderRequest>(c));
+  const placed = await getRepos().orders.place({ restaurantId: c.get("membership").restaurant.id, ...order, source: "staff", staffId: staffId(c) });
+  return c.json(placed, 201);
+});
+
+const rid = (c: { get: (k: "membership") => Membership }) => c.get("membership").restaurant.id;
+const billParam = (c: { req: { param: (k: string) => string } }) => {
+  const id = c.req.param("id");
+  if (!UUID.test(id)) bad("Unknown bill.");
+  return id;
+};
+async function billOr404(restaurantId: string, billId: string) {
+  const bill = await getRepos().bills.get(restaurantId, billId);
+  if (!bill) notFound("Bill not found.");
+  return bill!;
+}
+
+staff.get("/bills", allow(ORDER_TAKERS), async (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json({ bills: await getRepos().bills.listOpen(rid(c)) });
+});
+
+staff.get("/bills/:id", allow(ORDER_TAKERS), async (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json({ bill: await billOr404(rid(c), billParam(c)) });
+});
+
+// One payment; several make a split. The bill closes when the total is covered.
+staff.post("/bills/:id/payments", allow(CASHIERS), async (c) => {
+  const id = billParam(c);
+  const b = await body<BillPaymentRequest>(c);
+  if (!b.method || !METHODS.includes(b.method)) bad("Choose how this was paid.");
+  if (!Number.isInteger(b.amountPaise) || (b.amountPaise as number) <= 0) bad("Enter an amount up to the balance due.");
+  if (!Number.isInteger(b.expectedTotalPaise)) bad("Refresh the bill and try again.");
+  await getRepos().bills.pay(rid(c), id, { method: b.method, amountPaise: b.amountPaise as number, expectedTotalPaise: b.expectedTotalPaise as number }, staffId(c));
+  return c.json({ bill: await billOr404(rid(c), id) });
+});
+
+// Discounts and waiving the service charge: owner/manager only, discount needs a reason.
+staff.patch("/bills/:id", allow(MANAGERS), async (c) => {
+  const id = billParam(c);
+  const b = await body<BillPatch>(c);
+  const patch: { discountPaise?: number; discountReason?: string | null; serviceChargeOn?: boolean } = {};
+  if (b.discountPaise !== undefined) {
+    if (!Number.isInteger(b.discountPaise) || b.discountPaise < 0 || b.discountPaise > 10_000_000) bad("Enter a discount in rupees.");
+    const reason = String(b.discountReason ?? "").trim();
+    if (b.discountPaise > 0 && (reason.length < 2 || reason.length > 120)) bad("Give a short reason for the discount.");
+    patch.discountPaise = b.discountPaise;
+    patch.discountReason = b.discountPaise > 0 ? reason : null;
+  }
+  if (b.serviceChargeOn !== undefined) patch.serviceChargeOn = !!b.serviceChargeOn;
+  if (Object.keys(patch).length === 0) bad("Nothing to update.");
+  if (!(await getRepos().bills.update(rid(c), id, patch))) notFound("This bill is already closed.");
+  return c.json({ bill: await billOr404(rid(c), id) });
+});
+
+staff.post("/bills/:id/move", allow(ORDER_TAKERS), async (c) => {
+  const id = billParam(c);
+  const { tableId } = await body<{ tableId: string }>(c);
+  if (typeof tableId !== "string" || !UUID.test(tableId)) bad("Choose a table.");
+  await getRepos().bills.move(rid(c), id, tableId);
+  return c.body(null, 204);
+});
+
+staff.post("/bills/:id/merge", allow(CASHIERS), async (c) => {
+  const id = billParam(c);
+  const { intoBillId } = await body<{ intoBillId: string }>(c);
+  if (typeof intoBillId !== "string" || !UUID.test(intoBillId) || intoBillId === id) bad("Choose another open bill.");
+  await getRepos().bills.merge(rid(c), id, intoBillId, staffId(c));
+  return c.body(null, 204);
+});
+
+staff.post("/bills/:id/void", allow(MANAGERS), async (c) => {
+  const id = billParam(c);
+  const reason = String((await body<{ reason: string }>(c)).reason ?? "").trim();
+  if (reason.length < 2 || reason.length > 120) bad("Give a short reason for voiding this bill.");
+  await getRepos().bills.void(rid(c), id, reason, staffId(c));
+  return c.body(null, 204);
+});
+
+staff.post("/order-items/:id/cancel", allow(MANAGERS), async (c) => {
+  const id = c.req.param("id");
+  if (!UUID.test(id)) bad("Unknown item.");
+  const b = await body<{ qty: number; reason: string }>(c);
+  const reason = String(b.reason ?? "").trim();
+  const qty = b.qty as number;
+  if (!Number.isInteger(qty) || qty < 1 || qty > 50) bad("Choose how many to cancel.");
+  if (reason.length < 2 || reason.length > 120) bad("Give a short reason, like 'out of stock'.");
+  await getRepos().orders.cancelItem(rid(c), id, qty, reason, staffId(c));
+  return c.body(null, 204);
+});
+
+// Sales for [from, to): a day is a day close. At most ~3 months per request.
+staff.get("/reports/sales", allow(MANAGERS), async (c) => {
+  const from = new Date(c.req.query("from") ?? "");
+  const to = new Date(c.req.query("to") ?? "");
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || to <= from || to.getTime() - from.getTime() > 93 * 86_400_000) {
+    bad("Choose a date range of up to 3 months.");
+  }
+  c.header("Cache-Control", "no-store");
+  return c.json(await getRepos().bills.salesReport(rid(c), from.toISOString(), to.toISOString()));
+});
+
 staff.post("/orders/:id/status", async (c) => {
   const { to } = await body<{ to: OrderStatus }>(c);
   if (!to || !STATUSES.includes(to)) bad("Unknown order status.");
@@ -516,7 +674,7 @@ staff.patch("/restaurant", allow(MANAGERS), async (c) => {
   return c.json(fresh!.restaurant);
 });
 
-staff.get("/tables", allow(MANAGERS), async (c) => {
+staff.get("/tables", allow(ORDER_TAKERS), async (c) => {
   const { restaurant } = c.get("membership");
   return c.json({ slug: restaurant.slug, tables: await getRepos().restaurants.listTables(restaurant.id) });
 });

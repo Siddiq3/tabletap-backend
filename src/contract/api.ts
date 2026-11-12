@@ -7,7 +7,7 @@
 // (Supabase today, AWS later) without touching either client.
 import type {
   DiningTable, Membership, Menu, MenuCategory, MenuItem, NewMenuItem, Order, OrderStatus, PaymentMethod, Restaurant,
-  StaffCall, StaffMember, StaffRole, UserProfile,
+  Bill, SalesReport, StaffCall, StaffMember, StaffRole, UserProfile,
 } from "./types";
 
 export interface PublicRestaurant {
@@ -31,10 +31,40 @@ export interface PlaceOrderRequest {
   items: { menuItemId: string; qty: number }[];
 }
 
+/** Staff adding items: to a table (its open bill), to a specific bill, or a new takeaway. Exactly one target. v8. */
+export interface StaffOrderRequest {
+  tableId?: string;
+  billId?: string;
+  takeaway?: { customerName?: string; customerPhone?: string };
+  items: { menuItemId: string; qty: number }[];
+  note?: string;
+}
+
+/** One payment towards a bill; several make a split. expectedTotalPaise is the total the cashier saw. v8. */
+export interface BillPaymentRequest {
+  method: PaymentMethod;
+  amountPaise: number;
+  expectedTotalPaise: number;
+}
+
+/** Managers: discount (needs a reason) and waiving the service charge. v8. */
+export interface BillPatch {
+  discountPaise?: number;
+  discountReason?: string;
+  serviceChargeOn?: boolean;
+}
+
 export interface PlaceOrderResponse {
+  /** v8: the bill the order joined. */
+  billId?: string;
   orderId: string;
   orderNo: number;
   totalPaise: number;
+}
+
+/** The guest's whole table bill while their order is still on it; null once settled. Added in v7. */
+export interface PublicBillResponse {
+  bill: Bill | null;
 }
 
 export interface PublicOrderResponse {
@@ -133,6 +163,11 @@ export interface UpdateRestaurantRequest {
   address?: string;
   upiId?: string;
   taxPercent?: number;
+  /** v8 */
+  gstin?: string;
+  fssai?: string;
+  serviceChargePercent?: number;
+  packagingPaise?: number;
 }
 
 export interface TablesResponse {
@@ -207,6 +242,8 @@ export function createApiClient(
     placeOrder: (body: PlaceOrderRequest) => call<PlaceOrderResponse>("POST", "/public/orders", body),
     publicOrder: (slug: string, orderId: string) =>
       call<PublicOrderResponse>("GET", `/public/r/${enc(slug)}/orders/${enc(orderId)}`),
+    publicBill: (slug: string, orderId: string) =>
+      call<PublicBillResponse>("GET", `/public/r/${enc(slug)}/orders/${enc(orderId)}/bill`),
 
     callStaff: (slug: string, tableId: string) => call<{ call: StaffCall }>("POST", `/public/r/${enc(slug)}/staff-calls`, { tableId }),
     staffCalls: () => call<{ calls: StaffCall[] }>("GET", "/staff/calls"),
@@ -228,6 +265,17 @@ export function createApiClient(
     board: () => call<{ orders: Order[] }>("GET", "/staff/orders"),
     moveOrder: (orderId: string, to: OrderStatus) => call<null>("POST", `/staff/orders/${enc(orderId)}/status`, { to }),
     markPaid: (orderId: string, method: PaymentMethod) => call<null>("POST", `/staff/orders/${enc(orderId)}/paid`, { method }),
+    // bills (v8): rounds from QR and staff, split payments, discounts, tables, takeaway, cancellations, reports
+    addOrder: (body: StaffOrderRequest) => call<PlaceOrderResponse>("POST", "/staff/orders", body),
+    bills: () => call<{ bills: Bill[] }>("GET", "/staff/bills"),
+    bill: (billId: string) => call<{ bill: Bill }>("GET", `/staff/bills/${enc(billId)}`),
+    payBill: (billId: string, body: BillPaymentRequest) => call<{ bill: Bill }>("POST", `/staff/bills/${enc(billId)}/payments`, body),
+    updateBill: (billId: string, patch: BillPatch) => call<{ bill: Bill }>("PATCH", `/staff/bills/${enc(billId)}`, patch),
+    moveBill: (billId: string, tableId: string) => call<null>("POST", `/staff/bills/${enc(billId)}/move`, { tableId }),
+    mergeBill: (billId: string, intoBillId: string) => call<null>("POST", `/staff/bills/${enc(billId)}/merge`, { intoBillId }),
+    voidBill: (billId: string, reason: string) => call<null>("POST", `/staff/bills/${enc(billId)}/void`, { reason }),
+    cancelItem: (orderItemId: string, body: { qty: number; reason: string }) => call<null>("POST", `/staff/order-items/${enc(orderItemId)}/cancel`, body),
+    salesReport: (fromIso: string, toIso: string) => call<SalesReport>("GET", `/staff/reports/sales?from=${enc(fromIso)}&to=${enc(toIso)}`),
     menu: () => call<Menu>("GET", "/staff/menu"),
     addCategory: (name: string) => call<MenuCategory>("POST", "/staff/menu/categories", { name }),
     addItem: (item: NewMenuItem) => call<MenuItem>("POST", "/staff/menu/items", item),
